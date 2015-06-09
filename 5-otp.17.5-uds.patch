@@ -1,0 +1,608 @@
+From 2d6ea2af08cb7c0a0f935d1eed71d60781409f3f Mon Sep 17 00:00:00 2001
+From: Serge Aleynikov <saleyn@gmail.com>
+Date: Tue, 27 Jan 2015 18:51:40 -0500
+Subject: [PATCH] Fixed ability to assign externally open fds to gen_tcp
+
+When a AF_LOCAL file descriptor is created externally (e.g. Unix
+Domain Socket) and passed to `gen_tcp:listen(0, [{fd, FD}])`, the
+implementation incorrectly assigned the address family to be equal
+to `inet`, which in the inet_drv driver translated to AF_INET instead
+of AF_LOCAL (or AF_UNIX), and an `einval` error code was returned.
+This patch fixes this problem such that the file descriptors of the
+`local` address family are supported in the inet:fdopen/5,
+gen_tcp:connect/3, gen_tcp:listen/2, gen_udp:open/2 calls.
+---
+ erts/configure.in                       |   2 +-
+ erts/emulator/drivers/common/inet_drv.c | 153 +++++++++++++++++++++++++++++---
+ erts/preloaded/src/prim_inet.erl        |  17 +++-
+ lib/kernel/doc/src/gen_tcp.xml          |   7 ++
+ lib/kernel/doc/src/gen_udp.xml          |   7 ++
+ lib/kernel/src/inet.erl                 |  20 +++--
+ lib/kernel/src/inet_int.hrl             |   6 +-
+ lib/kernel/src/inet_tcp.erl             |  11 ++-
+ lib/kernel/src/inet_udp.erl             |   8 +-
+ 9 files changed, 203 insertions(+), 28 deletions(-)
+
+diff --git a/erts/configure.in b/erts/configure.in
+index b3fe48d..d0bb12d 100644
+--- a/erts/configure.in
++++ b/erts/configure.in
+@@ -2228,7 +2228,7 @@ fi
+ dnl Need by run_erl.
+ AC_CHECK_FUNCS([openpty])
+ 
+-AC_CHECK_HEADERS(net/if_dl.h ifaddrs.h netpacket/packet.h)
++AC_CHECK_HEADERS(net/if_dl.h ifaddrs.h netpacket/packet.h sys/un.h)
+ AC_CHECK_FUNCS([getifaddrs])
+ 
+ dnl Checks for variables in6addr_any and in6addr_loopback,
+diff --git a/erts/emulator/drivers/common/inet_drv.c b/erts/emulator/drivers/common/inet_drv.c
+index 3fe5dac..6dbd41a 100644
+--- a/erts/emulator/drivers/common/inet_drv.c
++++ b/erts/emulator/drivers/common/inet_drv.c
+@@ -57,6 +57,9 @@
+ #ifdef HAVE_NETPACKET_PACKET_H
+ #include <netpacket/packet.h>
+ #endif
++#ifdef HAVE_SYS_UN_H
++#include <sys/un.h>
++#endif
+ 
+ /* All platforms fail on malloc errors. */
+ #define FATAL_MALLOC
+@@ -736,6 +739,7 @@ static int my_strncasecmp(const char *s1, const char *s2, size_t n)
+ #define INET_AF_INET6       2
+ #define INET_AF_ANY         3 /* INADDR_ANY or IN6ADDR_ANY_INIT */
+ #define INET_AF_LOOPBACK    4 /* INADDR_LOOPBACK or IN6ADDR_LOOPBACK_INIT */
++#define INET_AF_LOCAL       5
+ 
+ /* open and INET_REQ_GETTYPE enumeration */
+ #define INET_TYPE_STREAM    1
+@@ -1011,19 +1015,29 @@ typedef union {
+ #ifdef HAVE_IN6
+     struct sockaddr_in6 sai6;
+ #endif
++#ifdef HAVE_SYS_UN_H
++    struct sockaddr_un sal;
++#endif
+ } inet_address;
+ 
+ 
+ /* for AF_INET & AF_INET6 */
+ #define inet_address_port(x) ((x)->sai.sin_port)
+ 
++#ifdef HAVE_SYS_UN_H
++#define localaddrlen(family, data) \
++    ((family == AF_LOCAL) ? *(unsigned char*)(data) : 0)
++#else
++    0
++#endif
++
+ #if defined(HAVE_IN6) && defined(AF_INET6)
+-#define addrlen(family) \
++#define addrlen(family, data) \
+    ((family == AF_INET) ? sizeof(struct in_addr) : \
+-    ((family == AF_INET6) ? sizeof(struct in6_addr) : 0))
++    ((family == AF_INET6) ? sizeof(struct in6_addr) : localaddrlen(family, data)))
+ #else
+-#define addrlen(family) \
+-   ((family == AF_INET) ? sizeof(struct in_addr) : 0)
++#define addrlen(family, data) \
++   ((family == AF_INET) ? sizeof(struct in_addr) : localaddrlen(family, data))
+ #endif
+ 
+ typedef struct _multi_timer_data {
+@@ -1700,6 +1714,12 @@ static int load_ip_address(ErlDrvTermData* spec, int i, int family, char* buf)
+ 	spec[i++] = 8;
+     }
+ #endif
++#ifdef HAVE_SYS_UN_H
++    else if (family == AF_LOCAL) {
++	int len = *(unsigned char*)buf++;
++	i = LOAD_STRING(spec, i, buf, len);
++    }
++#endif
+     else {
+ 	spec[i++] = ERL_DRV_TUPLE;
+ 	spec[i++] = 0;
+@@ -3545,10 +3565,11 @@ static int tcp_error_message(tcp_descriptor* desc, int err)
+ #ifdef HAVE_UDP
+ /* 
+ ** active mode message:
+-**        {udp,  S, IP, Port, [H1,...Hsz | Data]} or
+-**	  {sctp, S, IP, Port, {[AncilData],  Event_or_Data}}
++**    {udp,  S, IP, Port, [H1,...Hsz | Data]} or
++**    {sctp, S, IP, Port, {[AncilData],  Event_or_Data}}
+ ** where
+ ** 	  [H1,...,HSz] are msg headers (without IP/Port, UDP only),
++**    [AddrLen, H2,...,HSz] are msg headers for UDP AF_LOCAL only
+ **	  Data  : List() | Binary()
+ */
+ static int packet_binary_message
+@@ -3558,6 +3579,7 @@ static int packet_binary_message
+     ErlDrvTermData spec [PACKET_ERL_DRV_TERM_DATA_LEN];
+     int i = 0;
+     int alen;
++    char* data = bin->orig_bytes+offs;
+ 
+     DEBUGF(("packet_binary_message(%ld): len = %d\r\n",
+ 	   (long)desc->port, len));
+@@ -3568,10 +3590,15 @@ static int packet_binary_message
+ #   endif
+     i = LOAD_PORT(spec, i, desc->dport);   		      /* S	  */
+     
+-    alen = addrlen(desc->sfamily);
+-    i = load_ip_address(spec, i, desc->sfamily, bin->orig_bytes+offs+3);
+-    i = load_ip_port(spec, i, bin->orig_bytes+offs+1);	      /* IP, Port */
++    alen = addrlen(desc->sfamily, data+3);
++    i = load_ip_address(spec, i, desc->sfamily, data+3);
++    i = load_ip_port(spec, i, data+1);	      		      /* IP, Port */
+     
++#   ifdef HAVE_SYS_UN_H
++    /* AF_LOCAL addresses have a prefix byte containing address length */
++    if (desc->sfamily == AF_LOCAL)
++	alen++;
++#   endif
+     offs += (alen + 3);
+     len  -= (alen + 3);
+ 
+@@ -4124,6 +4151,16 @@ static char* inet_set_address(int family, inet_address* dst,
+ 	return src + 2+16;
+     }
+ #endif
++#ifdef HAVE_SYS_UN_H
++    else if ((family == AF_LOCAL) && (*len >= 3+sizeof(struct sockaddr_un))) {
++	int n = *((unsigned char*)src+2);
++	dst->sal.sun_family  = family;
++	sys_memcpy(dst->sal.sun_path, src+3, n);
++	dst->sal.sun_path[n-1] = '\0';
++	*len = n;
++	return src + 3 + n;
++    }
++#endif
+     return NULL;
+ }
+ 
+@@ -4132,7 +4169,7 @@ static char* inet_set_address(int family, inet_address* dst,
+ ** or from argument if source data specifies constant address.
+ ** 
+ ** src = [TAG,P1,P0]           when TAG = INET_AF_ANY  | INET_AF_LOOPBACK
+-** src = [TAG,P1,P0,X1,X2,...] when TAG = INET_AF_INET | INET_AF_INET6
++** src = [TAG,P1,P0,X1,X2,...] when TAG = INET_AF_INET | INET_AF_INET6 | INET_AF_LOCAL
+ */
+ static char *inet_set_faddress(int family, inet_address* dst,
+ 			       char *src, ErlDrvSizeT* len) {
+@@ -4150,6 +4187,21 @@ static char *inet_set_faddress(int family, inet_address* dst,
+ 	family = AF_INET6;
+ 	break;
+ #   endif
++#   ifdef HAVE_SYS_UN_H
++    case INET_AF_LOCAL: {
++	int n;
++	if (*len || *len < 3) return NULL;
++	family = AF_LOCAL;
++	/* Next two bytes are the length of the local path (< 256) */
++	src++;
++	n = *(unsigned char*)src++;
++	if (n+3 > *len) return NULL;
++	dst->sal.sun_family = family;
++	sys_memcpy(dst->sal.sun_path, src, n);
++	*len = n;
++	break;
++    }
++#   endif
+     case INET_AF_ANY:
+     case INET_AF_LOOPBACK: {
+ 	int port;
+@@ -4213,7 +4265,6 @@ static char *inet_set_faddress(int family, inet_address* dst,
+     return inet_set_address(family, dst, src, len);
+ }
+ 
+-
+ /* Get a inaddr structure
+ ** src = inaddr structure
+ ** *len is the lenght of structure
+@@ -4246,9 +4297,54 @@ static int inet_get_address(char* dst, inet_address* src, unsigned int* len)
+ 	return 0;
+     }
+ #endif
++#ifdef HAVE_SYS_UN_H
++    else if ((family == AF_LOCAL) && *len > 0) {
++	int n = *len - 4;
++	dst[0] = INET_AF_LOCAL;
++	put_int16(0, dst+1);
++	if (n == 0 || n >= sizeof(src->sal.sun_path)) {
++	    *(dst+3) = 0;
++	    *len = 3+1;
++        } else {
++	    *(dst+3) = n;
++	    sys_memcpy(dst+4, src->sal.sun_path, n);
++	    *len = 3+1+n;
++	}
++	return 0;
++    }
++#endif
+     return -1;
+ }
+ 
++static int inet_family_get_address(inet_descriptor* desc, char* dst, inet_address* src, unsigned int* len)
++{
++#ifdef HAVE_SYS_UN_H
++    if (desc->sfamily == AF_LOCAL) {
++	int n = *len - 4;
++	dst[0] = INET_AF_LOCAL;
++	put_int16(0, dst+1);
++	if (n <= 0 || n >= sizeof(src->sal.sun_path)) {
++	    if (desc->name_ptr) {
++		char* p = desc->name_ptr->sal.sun_path;
++		n = strlen(p);
++                *(dst+3) = n;
++                sys_memcpy(dst+4, p, n);
++		*len = 3+1+n;
++	    } else {
++		*(dst+3) = 0;
++		*len = 3+1;
++	    }
++        } else {
++	    *(dst+3) = n;
++	    sys_memcpy(dst+4, src->sal.sun_path, n);
++	    *len = 3+1+n;
++	}
++	return 0;
++    }
++#endif
++    return inet_get_address(dst, src, len);
++}
++
+ /* Same as the above, but take family from the address structure,
+ ** and advance the address pointer to the next address
+ ** according to the size of the current,
+@@ -4279,6 +4375,19 @@ static int inet_address_to_erlang(char *dst, inet_address **src) {
+ 	(*src) = (inet_address *) (&(*src)->sai6 + 1);
+ 	return 1 + 2 + 16;
+ #endif
++#ifdef HAVE_SYS_UN_H
++    case AF_LOCAL: {
++	int n = strlen((*src)->sal.sun_path);
++	if (dst) {
++	    dst[0] = INET_AF_LOCAL;
++	    put_int16(0, dst+1);
++	    *(dst+3) = n;
++            sys_memcpy(dst+1+2+1, (*src)->sal.sun_path, n);
++	}
++	(*src) = (inet_address *) (&(*src)->sal + 1);
++	return 1+2+1+n;
++    }
++#endif
+     default:
+ 	return -1;
+     }
+@@ -4554,6 +4663,13 @@ static ErlDrvSSizeT inet_ctl_fdopen(inet_descriptor* desc, int domain, int type,
+             return ctl_error(sock_errno(), rbuf, rsize);
+         if (name.sa.sa_family != domain)
+             return ctl_error(EINVAL, rbuf, rsize);
++#ifdef HAVE_SYS_UN_H
++        if (domain == AF_LOCAL) {
++            sys_memcpy(&desc->name_addr, &name, sizeof(desc->name_addr));
++            if (desc->name_ptr == NULL)
++               desc->name_ptr = &desc->name_addr;
++        }
++#endif
+     }
+ #ifdef __OSE__        
+     /* for fdopen duplicating the sd will allow to uniquely identify
+@@ -8452,6 +8568,11 @@ static ErlDrvSSizeT inet_ctl(inet_descriptor* desc, int cmd, char* buf,
+ 	    put_int32(INET_AF_INET6, &tbuf[0]);
+ 	}
+ #endif
++#ifdef HAVE_SYS_UN_H
++	else if (desc->sfamily == AF_LOCAL) {
++	    put_int32(INET_AF_LOCAL, &tbuf[0]);
++	}
++#endif
+ 	else
+ 	    return ctl_error(EINVAL, rbuf, rsize);
+ 
+@@ -9158,6 +9279,11 @@ static ErlDrvSSizeT tcp_inet_ctl(ErlDrvData e, unsigned int cmd,
+ 	    return ctl_xerror("eafnosupport", rbuf, rsize);
+ 	    break;
+ #endif
++#ifdef HAVE_SYS_UN_H
++	case INET_AF_LOCAL:
++	    domain = AF_LOCAL;
++	    break;
++#endif
+ 	default:
+ 	    return ctl_error(EINVAL, rbuf, rsize);
+ 	}
+@@ -11157,6 +11283,9 @@ static ErlDrvSSizeT packet_inet_ctl(ErlDrvData e, unsigned int cmd, char* buf,
+ 	    return ctl_xerror("eafnosupport", rbuf, rsize);
+ 	    break;
+ #endif
++#ifdef HAVE_SYS_UN_H
++	case INET_AF_LOCAL: af = AF_LOCAL; break;
++#endif
+ 	default:
+ 	    return ctl_error(EINVAL, rbuf, rsize);
+ 	}
+@@ -11718,7 +11847,7 @@ static int packet_inet_input(udp_descriptor* udesc, HANDLE event)
+ 
+ 	    inet_input_count(desc, n);
+ 	    udesc->i_ptr += n;
+-	    inet_get_address(abuf, &other, &len);
++	    inet_family_get_address(desc, abuf, &other, &len);
+ 	    /* Copy formatted address to the buffer allocated; "len" is the
+ 	       actual length which must be <= than the original reserved.
+ 	       This means that the addr + data in the buffer are contiguous,
+diff --git a/erts/preloaded/src/prim_inet.erl b/erts/preloaded/src/prim_inet.erl
+index 79ff013..8cef111 100644
+--- a/erts/preloaded/src/prim_inet.erl
++++ b/erts/preloaded/src/prim_inet.erl
+@@ -69,6 +69,8 @@ open(Protocol, Family, Type) ->
+ open(Protocol, Family, Type, Opts) ->
+     open(Protocol, Family, Type, Opts, ?INET_REQ_OPEN, []).
+ 
++%% FDOPEN(tcp|udp|sctp, inet|inet6|local, stream|dgram|seqpacket, integer())
++
+ fdopen(Protocol, Family, Type, Fd) when is_integer(Fd) ->
+     fdopen(Protocol, Family, Type, Fd, true).
+ 
+@@ -103,8 +105,9 @@ open(Protocol, Family, Type, Opts, Req, Data) ->
+ 	error:system_limit -> {error, system_limit}
+     end.
+ 
+-enc_family(inet) -> ?INET_AF_INET;
+-enc_family(inet6) -> ?INET_AF_INET6.
++enc_family(inet)  -> ?INET_AF_INET;
++enc_family(inet6) -> ?INET_AF_INET6;
++enc_family(local) -> ?INET_AF_LOCAL.
+ 
+ enc_type(stream) -> ?INET_TYPE_STREAM;
+ enc_type(dgram) -> ?INET_TYPE_DGRAM;
+@@ -1626,6 +1629,8 @@ enc_value_2(addr, {IP,Port}) when tuple_size(IP) =:= 4 ->
+     [?INET_AF_INET,?int16(Port)|ip4_to_bytes(IP)];
+ enc_value_2(addr, {IP,Port}) when tuple_size(IP) =:= 8 ->
+     [?INET_AF_INET6,?int16(Port)|ip6_to_bytes(IP)];
++enc_value_2(addr, {File,0}) when is_list(File) ->
++    [?INET_AF_LOCAL,0,0,length(File)|File];
+ enc_value_2(ether, [_,_,_,_,_,_]=Xs) -> Xs;
+ enc_value_2(sockaddr, any) ->
+     [?INET_AF_ANY];
+@@ -1635,6 +1640,8 @@ enc_value_2(sockaddr, IP) when tuple_size(IP) =:= 4 ->
+     [?INET_AF_INET|ip4_to_bytes(IP)];
+ enc_value_2(sockaddr, IP) when tuple_size(IP) =:= 8 ->
+     [?INET_AF_INET6|ip6_to_bytes(IP)];
++enc_value_2(sockaddr, File) when is_list(File) ->
++    [?INET_AF_LOCAL,0,0,length(File)|File];
+ enc_value_2(linkaddr, Linkaddr) ->
+     [?int16(length(Linkaddr)),Linkaddr];
+ enc_value_2(sctp_assoc_id, Val) -> ?int32(Val);
+@@ -2272,8 +2279,10 @@ get_addrs([F,P1,P0|Addr]) ->
+     {IP,Addrs} = get_ip(F, Addr),
+     [{IP,?u16(P1, P0)}|get_addrs(Addrs)].
+ 
+-get_ip(?INET_AF_INET, Addr)  -> get_ip4(Addr);
+-get_ip(?INET_AF_INET6, Addr) -> get_ip6(Addr).
++get_ip(?INET_AF_INET,  Addr) -> get_ip4(Addr);
++get_ip(?INET_AF_INET6, Addr) -> get_ip6(Addr);
++get_ip(?INET_AF_LOCAL, [0])  -> {[], []};
++get_ip(?INET_AF_LOCAL, [N | Addr]) -> lists:split(N, Addr).
+ 
+ get_ip4([A,B,C,D | T]) -> {{A,B,C,D},T}.
+ 
+diff --git a/lib/kernel/doc/src/gen_tcp.xml b/lib/kernel/doc/src/gen_tcp.xml
+index 820ecd1..c7d5ce9 100644
+--- a/lib/kernel/doc/src/gen_tcp.xml
++++ b/lib/kernel/doc/src/gen_tcp.xml
+@@ -130,6 +130,13 @@ do_recv(Sock, Bs) ->
+             <p>Set up the socket for IPv6.</p>
+           </item>
+ 
++		  <tag><c>local</c></tag>
++		  <item>
++            <p>Set up the socket for local address family. This option is only
++               valid together with <c>{fd, integer()}</c> when the file descriptor
++               is of local address family (e.g. a Unix Domain Socket)</p>
++          </item>
++
+           <tag><c>{port, Port}</c></tag>
+           <item>
+             <p>Specify which local port number to use.</p>
+diff --git a/lib/kernel/doc/src/gen_udp.xml b/lib/kernel/doc/src/gen_udp.xml
+index 291d1b0..1b90d6d 100644
+--- a/lib/kernel/doc/src/gen_udp.xml
++++ b/lib/kernel/doc/src/gen_udp.xml
+@@ -100,6 +100,13 @@
+             <p>Set up the socket for IPv4.</p>
+           </item>
+ 
++		  <tag><c>local</c></tag>
++		  <item>
++            <p>Set up the socket for local address family. This option is only
++               valid together with <c>{fd, integer()}</c> when the file descriptor
++               is of local address family (e.g. a Unix Domain Socket)</p>
++          </item>
++
+ 		  <tag><c>{udp_module, module()}</c></tag>
+ 		  <item> <p>
+ 				  Override which callback module is used. Defaults to
+diff --git a/lib/kernel/src/inet.erl b/lib/kernel/src/inet.erl
+index 43bab8b..b22d897 100644
+--- a/lib/kernel/src/inet.erl
++++ b/lib/kernel/src/inet.erl
+@@ -39,7 +39,7 @@
+ 
+ -export([i/0, i/1, i/2]).
+ 
+--export([getll/1, getfd/1, open/8, fdopen/6]).
++-export([getll/1, getfd/1, open/8, fdopen/6, getfamily/1]).
+ 
+ -export([tcp_controlling_process/2, udp_controlling_process/2,
+ 	 tcp_close/1, udp_close/1]).
+@@ -132,7 +132,7 @@
+ 		 'running' | 'multicast' | 'loopback']} |
+       {'hwaddr', ether_address()}.
+ 
+--type address_family() :: 'inet' | 'inet6'.
++-type address_family() :: 'inet' | 'inet6' | 'local'.
+ -type socket_protocol() :: 'tcp' | 'udp' | 'sctp'.
+ -type socket_type() :: 'stream' | 'dgram' | 'seqpacket'.
+ -type stat_option() :: 
+@@ -708,6 +708,7 @@ con_opt([Opt | Opts], #connect_opts{} = R, As) ->
+ 	{tcp_module,_}  -> con_opt(Opts, R, As);
+ 	inet        -> con_opt(Opts, R, As);
+ 	inet6       -> con_opt(Opts, R, As);
++	local       -> con_opt(Opts, R#connect_opts { family = local }, As);
+ 	{netns,NS} ->
+ 	    BinNS = filename2binary(NS),
+ 	    case prim_inet:is_sockopt_val(netns, BinNS) of
+@@ -777,6 +778,7 @@ list_opt([Opt | Opts], #listen_opts{} = R, As) ->
+ 	{tcp_module,_}  -> list_opt(Opts, R, As);
+ 	inet         -> list_opt(Opts, R, As);
+ 	inet6        -> list_opt(Opts, R, As);
++	local        -> list_opt(Opts, R#listen_opts { family = local }, As);
+ 	{netns,NS} ->
+ 	    BinNS = filename2binary(NS),
+ 	    case prim_inet:is_sockopt_val(netns, BinNS) of
+@@ -832,8 +834,9 @@ udp_opt([Opt | Opts], #udp_opts{} = R, As) ->
+ 	binary      ->  udp_add(mode, binary, R, Opts, As);
+ 	list        ->  udp_add(mode, list, R, Opts, As);
+ 	{udp_module,_} -> udp_opt(Opts, R, As);
+-	inet        -> udp_opt(Opts, R, As);
+-	inet6       -> udp_opt(Opts, R, As);
++	inet        ->  udp_opt(Opts, R, As);
++	inet6       ->  udp_opt(Opts, R, As);
++	local       ->  udp_opt(Opts, R#udp_opts { family = local }, As);
+ 	{netns,NS} ->
+ 	    BinNS = filename2binary(NS),
+ 	    case prim_inet:is_sockopt_val(netns, BinNS) of
+@@ -1306,7 +1309,7 @@ fdopen(Fd, Addr, Port, Opts, Protocol, Family, Type, Module) ->
+     Bound = Port == 0 andalso IsAnyAddr,
+     case prim_inet:fdopen(Protocol, Family, Type, Fd, Bound) of
+ 	{ok, S} ->
+-	    case prim_inet:setopts(S, Opts) of
++	    case prim_inet:setopts(S, Opts -- [local]) of
+ 		ok ->
+                     case if
+                              Bound ->
+@@ -1333,6 +1336,13 @@ fdopen(Fd, Addr, Port, Opts, Protocol, Family, Type, Module) ->
+ 	Error -> Error
+     end.
+ 
++-spec getfamily(list()) -> atom().
++getfamily(Options) when is_list(Options) ->
++    case lists:member(local, Options) of
++    true  -> local;
++    false -> inet
++    end.
++
+ %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+ %%  socket stat
+ %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+diff --git a/lib/kernel/src/inet_int.hrl b/lib/kernel/src/inet_int.hrl
+index 889b596..7d41846 100644
+--- a/lib/kernel/src/inet_int.hrl
++++ b/lib/kernel/src/inet_int.hrl
+@@ -28,6 +28,7 @@
+ -define(INET_AF_INET6,        2).
+ -define(INET_AF_ANY,          3). % Fake for ANY in any address family
+ -define(INET_AF_LOOPBACK,     4). % Fake for LOOPBACK in any address family
++-define(INET_AF_LOCAL,        5). % For Unix Domain address family
+ 
+ %% type codes to open and gettype - INET_REQ_GETTYPE
+ -define(INET_TYPE_STREAM,     1).
+@@ -375,7 +376,8 @@
+ 	{ 
+ 	  ifaddr = any,     %% bind to interface address
+ 	  port   = 0,       %% bind to port (default is dynamic port)
+-	  fd      = -1,     %% fd >= 0 => already bound
++	  fd     = -1,      %% fd >= 0 => already bound
++	  family = inet,    %% address family
+ 	  opts   = []       %% [{active,true}] added in inet:connect_options
+ 	 }).
+ 
+@@ -385,6 +387,7 @@
+ 	  port   = 0,                %% bind to port (default is dynamic port)
+ 	  backlog = ?LISTEN_BACKLOG, %% backlog
+ 	  fd      = -1,              %% %% fd >= 0 => already bound
++	  family = inet,             %% address family
+ 	  opts   = []                %% [{active,true}] added in 
+ 	                             %% inet:listen_options
+ 	 }).
+@@ -394,6 +397,7 @@
+ 	  ifaddr = any,
+ 	  port   = 0,
+ 	  fd     = -1,
++	  family = inet,
+ 	  opts   = [{active,true}]
+ 	 }).
+ 
+diff --git a/lib/kernel/src/inet_tcp.erl b/lib/kernel/src/inet_tcp.erl
+index 4c2db16..5740eeb 100644
+--- a/lib/kernel/src/inet_tcp.erl
++++ b/lib/kernel/src/inet_tcp.erl
+@@ -93,9 +93,10 @@ do_connect({A,B,C,D}, Port, Opts, Time) when ?ip(A,B,C,D), ?port(Port) ->
+ 	{ok, #connect_opts{fd=Fd,
+ 			   ifaddr=BAddr={Ab,Bb,Cb,Db},
+ 			   port=BPort,
++			   family=Family,
+ 			   opts=SockOpts}}
+ 	when ?ip(Ab,Bb,Cb,Db), ?port(BPort) ->
+-	    case inet:open(Fd,BAddr,BPort,SockOpts,tcp,inet,stream,?MODULE) of
++	    case inet:open(Fd,BAddr,BPort,SockOpts,tcp,Family,stream,?MODULE) of
+ 		{ok, S} ->
+ 		    case prim_inet:connect(S, {A,B,C,D}, Port, Time) of
+ 			ok    -> {ok,S};
+@@ -115,9 +116,10 @@ listen(Port, Opts) ->
+ 	{ok, #listen_opts{fd=Fd,
+ 			  ifaddr=BAddr={A,B,C,D},
+ 			  port=BPort,
++			  family=Family,
+ 			  opts=SockOpts}=R}
+ 	when ?ip(A,B,C,D), ?port(BPort) ->
+-	    case inet:open(Fd,BAddr,BPort,SockOpts,tcp,inet,stream,?MODULE) of
++	    case inet:open(Fd,BAddr,BPort,SockOpts,tcp,Family,stream,?MODULE) of
+ 		{ok, S} ->
+ 		    case prim_inet:listen(S, R#listen_opts.backlog) of
+ 			ok -> {ok, S};
+@@ -150,4 +152,7 @@ accept(L,Timeout) ->
+ %% Create a port/socket from a file descriptor 
+ %%
+ fdopen(Fd, Opts) ->
+-    inet:fdopen(Fd, Opts, tcp, inet, stream, ?MODULE).
++    fdopen(Fd, inet:getfamily(Opts), Opts).
++
++fdopen(Fd, Family, Opts) ->
++    inet:fdopen(Fd, Opts, tcp, Family, stream, ?MODULE).
+diff --git a/lib/kernel/src/inet_udp.erl b/lib/kernel/src/inet_udp.erl
+index 80d930f..6fdd404 100644
+--- a/lib/kernel/src/inet_udp.erl
++++ b/lib/kernel/src/inet_udp.erl
+@@ -51,8 +51,9 @@ open(Port, Opts) ->
+ 	{ok, #udp_opts{fd=Fd,
+ 		       ifaddr=BAddr={A,B,C,D},
+ 		       port=BPort,
++		       family=Family,
+ 		       opts=SockOpts}} when ?ip(A,B,C,D), ?port(BPort) ->
+-	    inet:open(Fd,BAddr,BPort,SockOpts,udp,inet,dgram,?MODULE);
++	    inet:open(Fd,BAddr,BPort,SockOpts,udp,Family,dgram,?MODULE);
+ 	{ok, _} -> exit(badarg)
+     end.
+ 
+@@ -91,9 +92,12 @@ controlling_process(Socket, NewOwner) ->
+ %% Create a port/socket from a file descriptor 
+ %%
+ fdopen(Fd, Opts) ->
++    fdopen(Fd, inet:getfamily(Opts), Opts).
++
++fdopen(Fd, Family, Opts) ->
+     inet:fdopen(Fd, 
+ 		optuniquify([{recbuf, ?RECBUF} | Opts]), 
+-		udp, inet, dgram, ?MODULE).
++		udp, Family, dgram, ?MODULE).
+ 
+ 
+ %% Remove all duplicate options from an option list.
+-- 
+2.1.2
+

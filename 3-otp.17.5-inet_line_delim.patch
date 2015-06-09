@@ -1,0 +1,320 @@
+From 0a9b2dcbe832171bd6f6dc308bc5e32b73400798 Mon Sep 17 00:00:00 2001
+From: Serge Aleynikov <saleyn@gmail.com>
+Date: Tue, 2 Jun 2015 08:44:23 -0400
+Subject: [PATCH] Add {line_delimiter, Char} option to inet:setopts/2
+
+A new {line_delimiter, Char} option allows line-oriented TCP-based protocols
+to use a custom line delimiting character. It is to be used in conjunction
+with {packet, line}.
+
+This option also works with erlang:decode_packet/3 when its first argument
+is 'line'.
+---
+ erts/doc/src/erlang.xml                 |   4 ++++
+ erts/emulator/beam/atom.names           |   1 +
+ erts/emulator/beam/erl_bif_port.c       |  10 ++++++++--
+ erts/emulator/beam/packet_parser.c      |   5 +++--
+ erts/emulator/beam/packet_parser.h      |   3 ++-
+ erts/emulator/drivers/common/inet_drv.c |  11 +++++++++--
+ erts/preloaded/src/prim_inet.erl        |   3 +++
+ lib/kernel/doc/src/inet.xml             |   5 +++++
+ lib/kernel/src/inet.erl                 |   4 +++-
+ lib/kernel/src/inet_int.hrl             |   1 +
+ lib/kernel/test/bif_SUITE.erl           |  10 ++++++++++
+ lib/kernel/test/gen_tcp_api_SUITE.erl   |  17 ++++++++++++++++-
+ 13 files changed, 65 insertions(+), 9 deletions(-)
+
+diff --git a/erts/doc/src/erlang.xml b/erts/doc/src/erlang.xml
+index 3fea64c..97b5e52 100644
+--- a/erts/doc/src/erlang.xml
++++ b/erts/doc/src/erlang.xml
+@@ -897,6 +897,10 @@
+ 	      case when <c>packet_size</c> itself is not set. This usage is
+ 	      only intended for backward compatibility.</p>
+               </item>
++              <tag><c>{line_delimiter, 0 &le; char() &le; 255}</c></tag>
++              <item><p>For packet type <c>line</c>, sets delimiting character.
++                Default <c>$\n</c>.</p>
++              </item>
+             </taglist>
+         <pre>
+ > <input>erlang:decode_packet(1,&lt;&lt;3,"abcd"&gt;&gt;,[]).</input>
+diff --git a/erts/emulator/beam/atom.names b/erts/emulator/beam/atom.names
+index 5ec1409..8867cde 100644
+--- a/erts/emulator/beam/atom.names
++++ b/erts/emulator/beam/atom.names
+@@ -319,6 +319,7 @@ atom ldflags
+ atom Le='=<'
+ atom lf
+ atom line
++atom line_delimiter
+ atom line_length
+ atom linked_in_driver
+ atom links
+diff --git a/erts/emulator/beam/erl_bif_port.c b/erts/emulator/beam/erl_bif_port.c
+index 7ce950e..afdf750 100644
+--- a/erts/emulator/beam/erl_bif_port.c
++++ b/erts/emulator/beam/erl_bif_port.c
+@@ -1328,7 +1328,8 @@ BIF_RETTYPE decode_packet_3(BIF_ALIST_3)
+     ErlSubBin* rest;
+     Eterm res;
+     Eterm options;
+-    int code;
++    int   code;
++    char  delimiter = '\n';
+ 
+     if (!is_binary(BIF_ARG_2) || 
+         (!is_list(BIF_ARG_3) && !is_nil(BIF_ARG_3))) {
+@@ -1369,6 +1370,11 @@ BIF_RETTYPE decode_packet_3(BIF_ALIST_3)
+                 case am_line_length:
+                     trunc_len = val;
+                     goto next_option;
++                case am_line_delimiter:
++                    if (type == TCP_PB_LINE_LF && val >= 0 && val <= 255) {
++                        delimiter = (char)val;
++                        goto next_option;
++                    }
+                 }
+             }
+         }
+@@ -1389,7 +1395,7 @@ BIF_RETTYPE decode_packet_3(BIF_ALIST_3)
+         pca.aligned_ptr = bin_ptr;
+     }
+     packet_sz = packet_get_length(type, (char*)pca.aligned_ptr, pca.bin_sz,
+-                                  max_plen, trunc_len, &http_state);
++                                  max_plen, trunc_len, delimiter, &http_state);
+     if (!(packet_sz > 0 && packet_sz <= pca.bin_sz)) {
+         if (packet_sz < 0) {
+ 	    goto error;
+diff --git a/erts/emulator/beam/packet_parser.c b/erts/emulator/beam/packet_parser.c
+index db0e78b..66e34d2 100644
+--- a/erts/emulator/beam/packet_parser.c
++++ b/erts/emulator/beam/packet_parser.c
+@@ -255,6 +255,7 @@ int packet_get_length(enum PacketParseType htype,
+                       const char* ptr, unsigned n, /* Bytes read so far */
+                       unsigned max_plen,     /* Max packet length, 0=no limit */
+                       unsigned trunc_len,    /* Truncate (lines) if longer, 0=no limit */
++                      char     delimiter,    /* Line delimiting character */
+                       int*     statep)       /* Protocol specific state */
+ {
+     unsigned hlen, plen;
+@@ -298,9 +299,9 @@ int packet_get_length(enum PacketParseType htype,
+         goto remain;
+ 
+     case TCP_PB_LINE_LF: {
+-        /* TCP_PB_LINE_LF:  [Data ... \n]  */
++        /* TCP_PB_LINE_LF:  [Data ... Delimiter]  */
+         const char* ptr2;
+-        if ((ptr2 = memchr(ptr, '\n', n)) == NULL) {
++        if ((ptr2 = memchr(ptr, delimiter, n)) == NULL) {
+             if (n > max_plen && max_plen != 0) { /* packet full */
+                 DEBUGF((" => packet full (no NL)=%d\r\n", n));
+                 goto error;
+diff --git a/erts/emulator/beam/packet_parser.h b/erts/emulator/beam/packet_parser.h
+index 1c3a9aa..90cd66c 100644
+--- a/erts/emulator/beam/packet_parser.h
++++ b/erts/emulator/beam/packet_parser.h
+@@ -104,7 +104,8 @@ int packet_get_length(enum PacketParseType htype,
+ 		      const char* ptr, unsigned n,  /* Bytes read so far */
+ 		      unsigned max_plen,      /* Packet max length, 0=no limit */
+ 		      unsigned trunc_len,     /* Truncate (lines) if longer, 0=no limit */
+-		      int* statep);           /* Internal protocol state */
++		      char     delimiter,     /* Line delimiting character */
++		      int*     statep);       /* Internal protocol state */
+ 
+ ERTS_GLB_INLINE
+ void packet_get_body(enum PacketParseType htype,
+diff --git a/erts/emulator/drivers/common/inet_drv.c b/erts/emulator/drivers/common/inet_drv.c
+index 5196eb5..270c691 100644
+--- a/erts/emulator/drivers/common/inet_drv.c
++++ b/erts/emulator/drivers/common/inet_drv.c
+@@ -864,6 +864,7 @@ static int my_strncasecmp(const char *s1, const char *s2, size_t n)
+ #define INET_LOPT_MSGQ_HIWTRMRK     36  /* set local msgq high watermark */
+ #define INET_LOPT_MSGQ_LOWTRMRK     37  /* set local msgq low watermark */
+ #define INET_LOPT_NETNS             38  /* Network namespace pathname */
++#define INET_LOPT_LINE_DELIM        39  /* Line delimiting char */
+ /* SCTP options: a separate range, from 100: */
+ #define SCTP_OPT_RTOINFO		100
+ #define SCTP_OPT_ASSOCINFO		101
+@@ -1133,6 +1134,7 @@ typedef struct {
+ #else
+     Uint32        send_oct[2];  /* number of octets sent, 64 bits */
+ #endif
++    char          delimiter;    /* Line delimiting character (def: '\n')  */
+     unsigned long send_cnt;     /* number of packets sent */
+     unsigned long send_max;     /* maximum packet send */
+     double send_avg;            /* average packet size sent */
+@@ -6237,7 +6239,11 @@ static int inet_set_opts(inet_descriptor* desc, char* ptr, int len)
+ 	    len -= ival;
+ 	    continue;
+ #endif
+-
++    case INET_LOPT_LINE_DELIM:
++        DEBUGF(("inet_set_opts(%ld): s=%d, LINE_DELIM=%d\r\n",
++            (long)desc->port, desc->s, ival));
++        desc->delimiter = (char)ival;
++        continue;
+ 	case INET_OPT_REUSEADDR: 
+ #ifdef __WIN32__
+ 	    continue;  /* Bjorn says */
+@@ -8315,6 +8321,7 @@ static ErlDrvData inet_start(ErlDrvPort port, int size, int protocol)
+     desc->deliver = INET_DELIVER_TERM; /* standard term format */
+     desc->active  = INET_PASSIVE;      /* start passive */
+     desc->active_count = 0;
++    desc->delimiter    = '\n';         /* line delimiting char */
+     desc->oph = NULL;
+     desc->opt = NULL;
+ 
+@@ -9797,7 +9804,7 @@ static int tcp_remain(tcp_descriptor* desc, int* len)
+ 
+     tlen = packet_get_length(desc->inet.htype, ptr, n, 
+                              desc->inet.psize, desc->i_bufsz,
+-                             &desc->http_state);
++                             desc->inet.delimiter, &desc->http_state);
+ 
+     DEBUGF(("tcp_remain(%ld): s=%d, n=%d, nfill=%d nsz=%d, tlen %d\r\n",
+ 	    (long)desc->inet.port, desc->inet.s, n, nfill, nsz, tlen));
+diff --git a/erts/preloaded/src/prim_inet.erl b/erts/preloaded/src/prim_inet.erl
+index 79ff013..c79406d 100644
+--- a/erts/preloaded/src/prim_inet.erl
++++ b/erts/preloaded/src/prim_inet.erl
+@@ -1159,6 +1159,7 @@ enc_opt(delay_send)      -> ?INET_LOPT_TCP_DELAY_SEND;
+ enc_opt(packet_size)     -> ?INET_LOPT_PACKET_SIZE;
+ enc_opt(read_packets)    -> ?INET_LOPT_READ_PACKETS;
+ enc_opt(netns)           -> ?INET_LOPT_NETNS;
++enc_opt(line_delimiter)  -> ?INET_LOPT_LINE_DELIM;
+ enc_opt(raw)             -> ?INET_OPT_RAW;
+ % Names of SCTP opts:
+ enc_opt(sctp_rtoinfo)	 	   -> ?SCTP_OPT_RTOINFO;
+@@ -1216,6 +1217,7 @@ dec_opt(?INET_LOPT_TCP_DELAY_SEND)   -> delay_send;
+ dec_opt(?INET_LOPT_PACKET_SIZE)      -> packet_size;
+ dec_opt(?INET_LOPT_READ_PACKETS)     -> read_packets;
+ dec_opt(?INET_LOPT_NETNS)           -> netns;
++dec_opt(?INET_LOPT_LINE_DELIM)      -> line_delimiter;
+ dec_opt(?INET_OPT_RAW)              -> raw;
+ dec_opt(I) when is_integer(I)     -> undefined.
+ 
+@@ -1298,6 +1300,7 @@ type_opt_1(packet) ->
+ 	   {httph_bin,?TCP_PB_HTTPH_BIN},
+ 	   {ssl, ?TCP_PB_SSL_TLS}, % obsolete
+ 	   {ssl_tls, ?TCP_PB_SSL_TLS}]};
++type_opt_1(line_delimiter)  -> int;
+ type_opt_1(mode) ->
+     {enum,[{list, ?INET_MODE_LIST},
+ 	   {binary, ?INET_MODE_BINARY}]};
+diff --git a/lib/kernel/doc/src/inet.xml b/lib/kernel/doc/src/inet.xml
+index 77a8caa..de0f2ed 100644
+--- a/lib/kernel/doc/src/inet.xml
++++ b/lib/kernel/doc/src/inet.xml
+@@ -980,6 +980,11 @@ setcap cap_sys_admin,cap_sys_ptrace,cap_dac_read_search+epi beam.smp
+ 	    indicated length are accepted and not considered invalid due
+ 	    to internal buffer limitations.</p>
+           </item>
++          <tag><c>{line_delimiter, Char}</c>(TCP/IP sockets)</tag>
++          <item>
++            <p>Sets the line delimiting character for line oriented protocols
++              (<c>line</c>). Default value is <c>$\n</c>.</p>
++          </item>
+ 
+ 		  <tag><c>{priority, Priority}</c></tag>
+           <item> <p>Set the protocol-defined priority for all packets to be sent
+diff --git a/lib/kernel/src/inet.erl b/lib/kernel/src/inet.erl
+index ec2c350..bbfe12d 100644
+--- a/lib/kernel/src/inet.erl
++++ b/lib/kernel/src/inet.erl
+@@ -670,7 +670,7 @@ stats() ->
+ %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+ connect_options() ->
+     [tos, priority, reuseaddr, keepalive, linger, sndbuf, recbuf, nodelay,
+-     header, active, packet, packet_size, buffer, mode, deliver,
++     header, active, packet, packet_size, buffer, mode, deliver, line_delimiter,
+      exit_on_close, high_watermark, low_watermark, high_msgq_watermark,
+      low_msgq_watermark, send_timeout, send_timeout_close, delay_send, raw].
+     
+@@ -719,6 +719,8 @@ con_opt([Opt | Opts], #connect_opts{} = R, As) ->
+         {active,N} when is_integer(N), N < 32768, N >= -32768 ->
+             NOpts = lists:keydelete(active, 1, R#connect_opts.opts),
+             con_opt(Opts, R#connect_opts { opts = [{active,N}|NOpts] }, As);
++	{line_delimiter,C} when is_integer(C), C >= 0, C =< 255 ->
++	    con_add(line_delimiter, C, R, Opts, As);
+ 	{Name,Val} when is_atom(Name) -> con_add(Name, Val, R, Opts, As);
+ 	_ -> {error, badarg}
+     end;
+diff --git a/lib/kernel/src/inet_int.hrl b/lib/kernel/src/inet_int.hrl
+index 889b596..5833110 100644
+--- a/lib/kernel/src/inet_int.hrl
++++ b/lib/kernel/src/inet_int.hrl
+@@ -147,6 +147,7 @@
+ -define(INET_LOPT_MSGQ_HIWTRMRK,  36).
+ -define(INET_LOPT_MSGQ_LOWTRMRK,  37).
+ -define(INET_LOPT_NETNS,          38).
++-define(INET_LOPT_LINE_DELIM,     39).
+ % Specific SCTP options: separate range:
+ -define(SCTP_OPT_RTOINFO,	 	100).
+ -define(SCTP_OPT_ASSOCINFO,	 	101).
+diff --git a/lib/kernel/test/bif_SUITE.erl b/lib/kernel/test/bif_SUITE.erl
+index c369dca..5d63f31 100644
+--- a/lib/kernel/test/bif_SUITE.erl
++++ b/lib/kernel/test/bif_SUITE.erl
+@@ -32,6 +32,7 @@
+ 	 spawn_failures/1,
+ 
+ 	 run_fun/1,
++     decode_packet_delim/1,
+ 	 wilderness/1]).
+ 
+ -export([init_per_testcase/2, end_per_testcase/2]).
+@@ -515,6 +516,15 @@ fetch_proc_vals(Pid) ->
+     {value,{heap_size,HS}} = lists:keysearch(heap_size, 1, PI),
+     ?line {Ls, P, FA, HS}.
+      
++decode_packet_delim(doc) ->
++    ["Test erlang:packet_delim/3 with {line_delimiter,0} option"];
++decode_packet_delim(suite) ->
++    [];
++decode_packet_delim(Config) when is_list(Config) ->
++    {ok,<<"abc",0>>,<<"efg",0>>} =
++        erlang:decode_packet(line, <<"abc",0,"efg",0>>, [{line_delimiter, 0}]),
++    {more, undefined} = erlang:decode_packet(line, <<"abc",0,"efg",0>>, []).
++
+ % This testcase should probably be moved somewhere else
+ wilderness(doc) ->
+     ["Test that memory allocation command line options affecting the"
+diff --git a/lib/kernel/test/gen_tcp_api_SUITE.erl b/lib/kernel/test/gen_tcp_api_SUITE.erl
+index c27d265..f5112a3 100644
+--- a/lib/kernel/test/gen_tcp_api_SUITE.erl
++++ b/lib/kernel/test/gen_tcp_api_SUITE.erl
+@@ -30,7 +30,7 @@
+ 	 init_per_testcase/2, end_per_testcase/2,
+ 	 t_connect_timeout/1, t_accept_timeout/1,
+ 	 t_connect_bad/1,
+-	 t_recv_timeout/1, t_recv_eof/1,
++	 t_recv_timeout/1, t_recv_eof/1, t_recv_delim/1,
+ 	 t_shutdown_write/1, t_shutdown_both/1, t_shutdown_error/1,
+ 	 t_fdopen/1, t_fdconnect/1, t_implicit_inet6/1]).
+ 
+@@ -129,6 +129,21 @@ t_recv_eof(Config) when is_list(Config) ->
+     ?line {error, closed} = gen_tcp:recv(Client, 0),
+     ok.
+ 
++t_recv_delim(doc) -> "Test using message delimiter $X";
++t_recv_delim(suite) -> [];
++t_recv_delim(Config) when is_list(Config) ->
++    {ok, L} = gen_tcp:listen(0, []),
++    {ok, Port} = inet:port(L),
++    Opts = [{active,false},{packet,line},{line_delimiter,$X}],
++    {ok, Client} = gen_tcp:connect(localhost, Port, Opts),
++    {ok, A} = gen_tcp:accept(L),
++    ok = gen_tcp:send(A, "abcXefgX"),
++    {ok, "abcX"} = gen_tcp:recv(Client, 0, 0),
++    {ok, "efgX"} = gen_tcp:recv(Client, 0, 0),
++    ok = gen_tcp:close(Client),
++    ok = gen_tcp:close(A),
++    ok.
++
+ %%% gen_tcp:shutdown/2
+ 
+ t_shutdown_write(Config) when is_list(Config) ->
+-- 
+2.1.2
+
