@@ -1,8 +1,33 @@
+From 2d6ea2af08cb7c0a0f935d1eed71d60781409f3f Mon Sep 17 00:00:00 2001
+From: Serge Aleynikov <saleyn@gmail.com>
+Date: Tue, 27 Jan 2015 18:51:40 -0500
+Subject: [PATCH] Fixed ability to assign externally open fds to gen_tcp
+
+When a AF_LOCAL file descriptor is created externally (e.g. Unix
+Domain Socket) and passed to `gen_tcp:listen(0, [{fd, FD}])`, the
+implementation incorrectly assigned the address family to be equal
+to `inet`, which in the inet_drv driver translated to AF_INET instead
+of AF_LOCAL (or AF_UNIX), and an `einval` error code was returned.
+This patch fixes this problem such that the file descriptors of the
+`local` address family are supported in the inet:fdopen/5,
+gen_tcp:connect/3, gen_tcp:listen/2, gen_udp:open/2 calls.
+---
+ erts/configure.in                       |   2 +-
+ erts/emulator/drivers/common/inet_drv.c | 153 +++++++++++++++++++++++++++++---
+ erts/preloaded/src/prim_inet.erl        |  17 +++-
+ lib/kernel/doc/src/gen_tcp.xml          |   7 ++
+ lib/kernel/doc/src/gen_udp.xml          |   7 ++
+ lib/kernel/src/inet.erl                 |  20 +++--
+ lib/kernel/src/inet_int.hrl             |   6 +-
+ lib/kernel/src/inet_tcp.erl             |  11 ++-
+ lib/kernel/src/inet_udp.erl             |   8 +-
+ 9 files changed, 203 insertions(+), 28 deletions(-)
+
 diff --git a/erts/configure.in b/erts/configure.in
-index 22ca7ec..d98ca81 100644
+index b3fe48d..d0bb12d 100644
 --- a/erts/configure.in
 +++ b/erts/configure.in
-@@ -2229,7 +2229,7 @@ fi
+@@ -2228,7 +2228,7 @@ fi
  dnl Need by run_erl.
  AC_CHECK_FUNCS([openpty])
  
@@ -12,10 +37,10 @@ index 22ca7ec..d98ca81 100644
  
  dnl Checks for variables in6addr_any and in6addr_loopback,
 diff --git a/erts/emulator/drivers/common/inet_drv.c b/erts/emulator/drivers/common/inet_drv.c
-index 549de65..a0b711e 100644
+index 3fe5dac..6dbd41a 100644
 --- a/erts/emulator/drivers/common/inet_drv.c
 +++ b/erts/emulator/drivers/common/inet_drv.c
-@@ -58,6 +58,9 @@
+@@ -57,6 +57,9 @@
  #ifdef HAVE_NETPACKET_PACKET_H
  #include <netpacket/packet.h>
  #endif
@@ -25,7 +50,7 @@ index 549de65..a0b711e 100644
  
  /* All platforms fail on malloc errors. */
  #define FATAL_MALLOC
-@@ -747,6 +750,7 @@ static int my_strncasecmp(const char *s1, const char *s2, size_t n)
+@@ -736,6 +739,7 @@ static int my_strncasecmp(const char *s1, const char *s2, size_t n)
  #define INET_AF_INET6       2
  #define INET_AF_ANY         3 /* INADDR_ANY or IN6ADDR_ANY_INIT */
  #define INET_AF_LOOPBACK    4 /* INADDR_LOOPBACK or IN6ADDR_LOOPBACK_INIT */
@@ -33,15 +58,7 @@ index 549de65..a0b711e 100644
  
  /* open and INET_REQ_GETTYPE enumeration */
  #define INET_TYPE_STREAM    1
-@@ -885,6 +889,7 @@ static int my_strncasecmp(const char *s1, const char *s2, size_t n)
- #define INET_LOPT_MSGQ_LOWTRMRK     37  /* set local msgq low watermark */
- #define INET_LOPT_NETNS             38  /* Network namespace pathname */
- #define INET_LOPT_TCP_SHOW_ECONNRESET 39  /* tell user about incoming RST */
-+#define INET_LOPT_LINE_DELIM        40  /* Line delimiting char */
- /* SCTP options: a separate range, from 100: */
- #define SCTP_OPT_RTOINFO		100
- #define SCTP_OPT_ASSOCINFO		101
-@@ -1031,19 +1036,29 @@ typedef union {
+@@ -1011,19 +1015,29 @@ typedef union {
  #ifdef HAVE_IN6
      struct sockaddr_in6 sai6;
  #endif
@@ -75,15 +92,7 @@ index 549de65..a0b711e 100644
  #endif
  
  typedef struct _multi_timer_data {
-@@ -1154,6 +1169,7 @@ typedef struct {
- #else
-     Uint32        send_oct[2];  /* number of octets sent, 64 bits */
- #endif
-+    char          delimiter;    /* Line delimiting character (def: '\n')  */
-     unsigned long send_cnt;     /* number of packets sent */
-     unsigned long send_max;     /* maximum packet send */
-     double send_avg;            /* average packet size sent */
-@@ -1726,6 +1742,12 @@ static int load_ip_address(ErlDrvTermData* spec, int i, int family, char* buf)
+@@ -1700,6 +1714,12 @@ static int load_ip_address(ErlDrvTermData* spec, int i, int family, char* buf)
  	spec[i++] = 8;
      }
  #endif
@@ -96,7 +105,7 @@ index 549de65..a0b711e 100644
      else {
  	spec[i++] = ERL_DRV_TUPLE;
  	spec[i++] = 0;
-@@ -3571,10 +3593,11 @@ static int tcp_error_message(tcp_descriptor* desc, int err)
+@@ -3545,10 +3565,11 @@ static int tcp_error_message(tcp_descriptor* desc, int err)
  #ifdef HAVE_UDP
  /* 
  ** active mode message:
@@ -110,7 +119,7 @@ index 549de65..a0b711e 100644
  **	  Data  : List() | Binary()
  */
  static int packet_binary_message
-@@ -3584,6 +3607,7 @@ static int packet_binary_message
+@@ -3558,6 +3579,7 @@ static int packet_binary_message
      ErlDrvTermData spec [PACKET_ERL_DRV_TERM_DATA_LEN];
      int i = 0;
      int alen;
@@ -118,7 +127,7 @@ index 549de65..a0b711e 100644
  
      DEBUGF(("packet_binary_message(%ld): len = %d\r\n",
  	   (long)desc->port, len));
-@@ -3594,10 +3618,15 @@ static int packet_binary_message
+@@ -3568,10 +3590,15 @@ static int packet_binary_message
  #   endif
      i = LOAD_PORT(spec, i, desc->dport);   		      /* S	  */
      
@@ -137,7 +146,7 @@ index 549de65..a0b711e 100644
      offs += (alen + 3);
      len  -= (alen + 3);
  
-@@ -4150,6 +4179,16 @@ static char* inet_set_address(int family, inet_address* dst,
+@@ -4124,6 +4151,16 @@ static char* inet_set_address(int family, inet_address* dst,
  	return src + 2+16;
      }
  #endif
@@ -154,7 +163,7 @@ index 549de65..a0b711e 100644
      return NULL;
  }
  
-@@ -4158,7 +4197,7 @@ static char* inet_set_address(int family, inet_address* dst,
+@@ -4132,7 +4169,7 @@ static char* inet_set_address(int family, inet_address* dst,
  ** or from argument if source data specifies constant address.
  ** 
  ** src = [TAG,P1,P0]           when TAG = INET_AF_ANY  | INET_AF_LOOPBACK
@@ -163,7 +172,7 @@ index 549de65..a0b711e 100644
  */
  static char *inet_set_faddress(int family, inet_address* dst,
  			       char *src, ErlDrvSizeT* len) {
-@@ -4176,6 +4215,21 @@ static char *inet_set_faddress(int family, inet_address* dst,
+@@ -4150,6 +4187,21 @@ static char *inet_set_faddress(int family, inet_address* dst,
  	family = AF_INET6;
  	break;
  #   endif
@@ -185,7 +194,7 @@ index 549de65..a0b711e 100644
      case INET_AF_ANY:
      case INET_AF_LOOPBACK: {
  	int port;
-@@ -4239,7 +4293,6 @@ static char *inet_set_faddress(int family, inet_address* dst,
+@@ -4213,7 +4265,6 @@ static char *inet_set_faddress(int family, inet_address* dst,
      return inet_set_address(family, dst, src, len);
  }
  
@@ -193,7 +202,7 @@ index 549de65..a0b711e 100644
  /* Get a inaddr structure
  ** src = inaddr structure
  ** *len is the lenght of structure
-@@ -4272,9 +4325,54 @@ static int inet_get_address(char* dst, inet_address* src, unsigned int* len)
+@@ -4246,9 +4297,54 @@ static int inet_get_address(char* dst, inet_address* src, unsigned int* len)
  	return 0;
      }
  #endif
@@ -248,7 +257,7 @@ index 549de65..a0b711e 100644
  /* Same as the above, but take family from the address structure,
  ** and advance the address pointer to the next address
  ** according to the size of the current,
-@@ -4305,6 +4403,19 @@ static int inet_address_to_erlang(char *dst, inet_address **src) {
+@@ -4279,6 +4375,19 @@ static int inet_address_to_erlang(char *dst, inet_address **src) {
  	(*src) = (inet_address *) (&(*src)->sai6 + 1);
  	return 1 + 2 + 16;
  #endif
@@ -268,7 +277,7 @@ index 549de65..a0b711e 100644
      default:
  	return -1;
      }
-@@ -4580,6 +4691,13 @@ static ErlDrvSSizeT inet_ctl_fdopen(inet_descriptor* desc, int domain, int type,
+@@ -4554,6 +4663,13 @@ static ErlDrvSSizeT inet_ctl_fdopen(inet_descriptor* desc, int domain, int type,
              return ctl_error(sock_errno(), rbuf, rsize);
          if (name.sa.sa_family != domain)
              return ctl_error(EINVAL, rbuf, rsize);
@@ -282,28 +291,7 @@ index 549de65..a0b711e 100644
      }
  #ifdef __OSE__        
      /* for fdopen duplicating the sd will allow to uniquely identify
-@@ -6276,6 +6394,12 @@ static int inet_set_opts(inet_descriptor* desc, char* ptr, int len)
- 	    }
- 	    continue;
- 
-+    case INET_LOPT_LINE_DELIM:
-+        DEBUGF(("inet_set_opts(%ld): s=%d, LINE_DELIM=%d\r\n",
-+            (long)desc->port, desc->s, ival));
-+        desc->delimiter = (char)ival;
-+        continue;
-+
- 	case INET_OPT_REUSEADDR: 
- #ifdef __WIN32__
- 	    continue;  /* Bjorn says */
-@@ -8371,6 +8495,7 @@ static ErlDrvData inet_start(ErlDrvPort port, int size, int protocol)
-     desc->deliver = INET_DELIVER_TERM; /* standard term format */
-     desc->active  = INET_PASSIVE;      /* start passive */
-     desc->active_count = 0;
-+    desc->delimiter    = '\n';         /* line delimiting char */
-     desc->oph = NULL;
-     desc->opt = NULL;
- 
-@@ -8561,6 +8686,11 @@ static ErlDrvSSizeT inet_ctl(inet_descriptor* desc, int cmd, char* buf,
+@@ -8452,6 +8568,11 @@ static ErlDrvSSizeT inet_ctl(inet_descriptor* desc, int cmd, char* buf,
  	    put_int32(INET_AF_INET6, &tbuf[0]);
  	}
  #endif
@@ -315,7 +303,7 @@ index 549de65..a0b711e 100644
  	else
  	    return ctl_error(EINVAL, rbuf, rsize);
  
-@@ -9246,6 +9376,11 @@ static ErlDrvSSizeT tcp_inet_ctl(ErlDrvData e, unsigned int cmd,
+@@ -9158,6 +9279,11 @@ static ErlDrvSSizeT tcp_inet_ctl(ErlDrvData e, unsigned int cmd,
  	    return ctl_xerror("eafnosupport", rbuf, rsize);
  	    break;
  #endif
@@ -327,16 +315,7 @@ index 549de65..a0b711e 100644
  	default:
  	    return ctl_error(EINVAL, rbuf, rsize);
  	}
-@@ -9882,7 +10017,7 @@ static int tcp_remain(tcp_descriptor* desc, int* len)
- 
-     tlen = packet_get_length(desc->inet.htype, ptr, n, 
-                              desc->inet.psize, desc->i_bufsz,
--                             &desc->http_state);
-+                             desc->inet.delimiter, &desc->http_state);
- 
-     DEBUGF(("tcp_remain(%ld): s=%d, n=%d, nfill=%d nsz=%d, tlen %d\r\n",
- 	    (long)desc->inet.port, desc->inet.s, n, nfill, nsz, tlen));
-@@ -11334,6 +11469,9 @@ static ErlDrvSSizeT packet_inet_ctl(ErlDrvData e, unsigned int cmd, char* buf,
+@@ -11157,6 +11283,9 @@ static ErlDrvSSizeT packet_inet_ctl(ErlDrvData e, unsigned int cmd, char* buf,
  	    return ctl_xerror("eafnosupport", rbuf, rsize);
  	    break;
  #endif
@@ -346,7 +325,7 @@ index 549de65..a0b711e 100644
  	default:
  	    return ctl_error(EINVAL, rbuf, rsize);
  	}
-@@ -11945,7 +12083,7 @@ static int packet_inet_input(udp_descriptor* udesc, HANDLE event)
+@@ -11718,7 +11847,7 @@ static int packet_inet_input(udp_descriptor* udesc, HANDLE event)
  
  	    inet_input_count(desc, n);
  	    udesc->i_ptr += n;
@@ -356,10 +335,10 @@ index 549de65..a0b711e 100644
  	       actual length which must be <= than the original reserved.
  	       This means that the addr + data in the buffer are contiguous,
 diff --git a/erts/preloaded/src/prim_inet.erl b/erts/preloaded/src/prim_inet.erl
-index 4d04e1d..688131a 100644
+index 79ff013..8cef111 100644
 --- a/erts/preloaded/src/prim_inet.erl
 +++ b/erts/preloaded/src/prim_inet.erl
-@@ -70,6 +70,8 @@ open(Protocol, Family, Type) ->
+@@ -69,6 +69,8 @@ open(Protocol, Family, Type) ->
  open(Protocol, Family, Type, Opts) ->
      open(Protocol, Family, Type, Opts, ?INET_REQ_OPEN, []).
  
@@ -368,7 +347,7 @@ index 4d04e1d..688131a 100644
  fdopen(Protocol, Family, Type, Fd) when is_integer(Fd) ->
      fdopen(Protocol, Family, Type, Fd, true).
  
-@@ -104,8 +106,9 @@ open(Protocol, Family, Type, Opts, Req, Data) ->
+@@ -103,8 +105,9 @@ open(Protocol, Family, Type, Opts, Req, Data) ->
  	error:system_limit -> {error, system_limit}
      end.
  
@@ -380,31 +359,7 @@ index 4d04e1d..688131a 100644
  
  enc_type(stream) -> ?INET_TYPE_STREAM;
  enc_type(dgram) -> ?INET_TYPE_DGRAM;
-@@ -1147,6 +1150,7 @@ enc_opt(packet_size)     -> ?INET_LOPT_PACKET_SIZE;
- enc_opt(read_packets)    -> ?INET_LOPT_READ_PACKETS;
- enc_opt(netns)           -> ?INET_LOPT_NETNS;
- enc_opt(show_econnreset) -> ?INET_LOPT_TCP_SHOW_ECONNRESET;
-+enc_opt(line_delimiter)  -> ?INET_LOPT_LINE_DELIM;
- enc_opt(raw)             -> ?INET_OPT_RAW;
- % Names of SCTP opts:
- enc_opt(sctp_rtoinfo)	 	   -> ?SCTP_OPT_RTOINFO;
-@@ -1205,6 +1209,7 @@ dec_opt(?INET_LOPT_PACKET_SIZE)      -> packet_size;
- dec_opt(?INET_LOPT_READ_PACKETS)     -> read_packets;
- dec_opt(?INET_LOPT_NETNS)           -> netns;
- dec_opt(?INET_LOPT_TCP_SHOW_ECONNRESET) -> show_econnreset;
-+dec_opt(?INET_LOPT_LINE_DELIM)      -> line_delimiter;
- dec_opt(?INET_OPT_RAW)              -> raw;
- dec_opt(I) when is_integer(I)     -> undefined.
- 
-@@ -1287,6 +1292,7 @@ type_opt_1(packet) ->
- 	   {httph_bin,?TCP_PB_HTTPH_BIN},
- 	   {ssl, ?TCP_PB_SSL_TLS}, % obsolete
- 	   {ssl_tls, ?TCP_PB_SSL_TLS}]};
-+type_opt_1(line_delimiter)  -> int;
- type_opt_1(mode) ->
-     {enum,[{list, ?INET_MODE_LIST},
- 	   {binary, ?INET_MODE_BINARY}]};
-@@ -1616,6 +1622,8 @@ enc_value_2(addr, {IP,Port}) when tuple_size(IP) =:= 4 ->
+@@ -1626,6 +1629,8 @@ enc_value_2(addr, {IP,Port}) when tuple_size(IP) =:= 4 ->
      [?INET_AF_INET,?int16(Port)|ip4_to_bytes(IP)];
  enc_value_2(addr, {IP,Port}) when tuple_size(IP) =:= 8 ->
      [?INET_AF_INET6,?int16(Port)|ip6_to_bytes(IP)];
@@ -413,7 +368,7 @@ index 4d04e1d..688131a 100644
  enc_value_2(ether, [_,_,_,_,_,_]=Xs) -> Xs;
  enc_value_2(sockaddr, any) ->
      [?INET_AF_ANY];
-@@ -1625,6 +1633,8 @@ enc_value_2(sockaddr, IP) when tuple_size(IP) =:= 4 ->
+@@ -1635,6 +1640,8 @@ enc_value_2(sockaddr, IP) when tuple_size(IP) =:= 4 ->
      [?INET_AF_INET|ip4_to_bytes(IP)];
  enc_value_2(sockaddr, IP) when tuple_size(IP) =:= 8 ->
      [?INET_AF_INET6|ip6_to_bytes(IP)];
@@ -422,7 +377,7 @@ index 4d04e1d..688131a 100644
  enc_value_2(linkaddr, Linkaddr) ->
      [?int16(length(Linkaddr)),Linkaddr];
  enc_value_2(sctp_assoc_id, Val) -> ?int32(Val);
-@@ -2262,8 +2272,10 @@ get_addrs([F,P1,P0|Addr]) ->
+@@ -2272,8 +2279,10 @@ get_addrs([F,P1,P0|Addr]) ->
      {IP,Addrs} = get_ip(F, Addr),
      [{IP,?u16(P1, P0)}|get_addrs(Addrs)].
  
@@ -436,10 +391,10 @@ index 4d04e1d..688131a 100644
  get_ip4([A,B,C,D | T]) -> {{A,B,C,D},T}.
  
 diff --git a/lib/kernel/doc/src/gen_tcp.xml b/lib/kernel/doc/src/gen_tcp.xml
-index 8d9f09c..fb6f033 100644
+index 820ecd1..c7d5ce9 100644
 --- a/lib/kernel/doc/src/gen_tcp.xml
 +++ b/lib/kernel/doc/src/gen_tcp.xml
-@@ -131,6 +131,13 @@ do_recv(Sock, Bs) ->
+@@ -130,6 +130,13 @@ do_recv(Sock, Bs) ->
              <p>Set up the socket for IPv6.</p>
            </item>
  
@@ -454,10 +409,10 @@ index 8d9f09c..fb6f033 100644
            <item>
              <p>Specify which local port number to use.</p>
 diff --git a/lib/kernel/doc/src/gen_udp.xml b/lib/kernel/doc/src/gen_udp.xml
-index 6f34aba..3b7ee9a 100644
+index 291d1b0..1b90d6d 100644
 --- a/lib/kernel/doc/src/gen_udp.xml
 +++ b/lib/kernel/doc/src/gen_udp.xml
-@@ -101,6 +101,13 @@
+@@ -100,6 +100,13 @@
              <p>Set up the socket for IPv4.</p>
            </item>
  
@@ -472,10 +427,10 @@ index 6f34aba..3b7ee9a 100644
  		  <item> <p>
  				  Override which callback module is used. Defaults to
 diff --git a/lib/kernel/src/inet.erl b/lib/kernel/src/inet.erl
-index da7f040..f4afe40 100644
+index 43bab8b..b22d897 100644
 --- a/lib/kernel/src/inet.erl
 +++ b/lib/kernel/src/inet.erl
-@@ -40,7 +40,7 @@
+@@ -39,7 +39,7 @@
  
  -export([i/0, i/1, i/2]).
  
@@ -484,7 +439,7 @@ index da7f040..f4afe40 100644
  
  -export([tcp_controlling_process/2, udp_controlling_process/2,
  	 tcp_close/1, udp_close/1]).
-@@ -133,7 +133,7 @@
+@@ -132,7 +132,7 @@
  		 'running' | 'multicast' | 'loopback']} |
        {'hwaddr', ether_address()}.
  
@@ -493,16 +448,7 @@ index da7f040..f4afe40 100644
  -type socket_protocol() :: 'tcp' | 'udp' | 'sctp'.
  -type socket_type() :: 'stream' | 'dgram' | 'seqpacket'.
  -type stat_option() :: 
-@@ -671,7 +671,7 @@ stats() ->
- %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
- connect_options() ->
-     [tos, priority, reuseaddr, keepalive, linger, sndbuf, recbuf, nodelay,
--     header, active, packet, packet_size, buffer, mode, deliver,
-+     header, active, packet, packet_size, buffer, mode, deliver, line_delimiter,
-      exit_on_close, high_watermark, low_watermark, high_msgq_watermark,
-      low_msgq_watermark, send_timeout, send_timeout_close, delay_send, raw,
-      show_econnreset].
-@@ -710,6 +710,7 @@ con_opt([Opt | Opts], #connect_opts{} = R, As) ->
+@@ -708,6 +708,7 @@ con_opt([Opt | Opts], #connect_opts{} = R, As) ->
  	{tcp_module,_}  -> con_opt(Opts, R, As);
  	inet        -> con_opt(Opts, R, As);
  	inet6       -> con_opt(Opts, R, As);
@@ -510,16 +456,7 @@ index da7f040..f4afe40 100644
  	{netns,NS} ->
  	    BinNS = filename2binary(NS),
  	    case prim_inet:is_sockopt_val(netns, BinNS) of
-@@ -721,6 +722,8 @@ con_opt([Opt | Opts], #connect_opts{} = R, As) ->
-         {active,N} when is_integer(N), N < 32768, N >= -32768 ->
-             NOpts = lists:keydelete(active, 1, R#connect_opts.opts),
-             con_opt(Opts, R#connect_opts { opts = [{active,N}|NOpts] }, As);
-+	{line_delimiter,C} when is_integer(C), C >= 0, C =< 255 ->
-+	    con_add(line_delimiter, C, R, Opts, As);
- 	{Name,Val} when is_atom(Name) -> con_add(Name, Val, R, Opts, As);
- 	_ -> {error, badarg}
-     end;
-@@ -779,6 +782,7 @@ list_opt([Opt | Opts], #listen_opts{} = R, As) ->
+@@ -777,6 +778,7 @@ list_opt([Opt | Opts], #listen_opts{} = R, As) ->
  	{tcp_module,_}  -> list_opt(Opts, R, As);
  	inet         -> list_opt(Opts, R, As);
  	inet6        -> list_opt(Opts, R, As);
@@ -527,7 +464,7 @@ index da7f040..f4afe40 100644
  	{netns,NS} ->
  	    BinNS = filename2binary(NS),
  	    case prim_inet:is_sockopt_val(netns, BinNS) of
-@@ -834,8 +838,9 @@ udp_opt([Opt | Opts], #udp_opts{} = R, As) ->
+@@ -832,8 +834,9 @@ udp_opt([Opt | Opts], #udp_opts{} = R, As) ->
  	binary      ->  udp_add(mode, binary, R, Opts, As);
  	list        ->  udp_add(mode, list, R, Opts, As);
  	{udp_module,_} -> udp_opt(Opts, R, As);
@@ -539,7 +476,7 @@ index da7f040..f4afe40 100644
  	{netns,NS} ->
  	    BinNS = filename2binary(NS),
  	    case prim_inet:is_sockopt_val(netns, BinNS) of
-@@ -1308,7 +1313,7 @@ fdopen(Fd, Addr, Port, Opts, Protocol, Family, Type, Module) ->
+@@ -1306,7 +1309,7 @@ fdopen(Fd, Addr, Port, Opts, Protocol, Family, Type, Module) ->
      Bound = Port == 0 andalso IsAnyAddr,
      case prim_inet:fdopen(Protocol, Family, Type, Fd, Bound) of
  	{ok, S} ->
@@ -548,7 +485,7 @@ index da7f040..f4afe40 100644
  		ok ->
                      case if
                               Bound ->
-@@ -1335,6 +1340,13 @@ fdopen(Fd, Addr, Port, Opts, Protocol, Family, Type, Module) ->
+@@ -1333,6 +1336,13 @@ fdopen(Fd, Addr, Port, Opts, Protocol, Family, Type, Module) ->
  	Error -> Error
      end.
  
@@ -563,10 +500,10 @@ index da7f040..f4afe40 100644
  %%  socket stat
  %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 diff --git a/lib/kernel/src/inet_int.hrl b/lib/kernel/src/inet_int.hrl
-index bfe4c9e..0a22012 100644
+index 889b596..7d41846 100644
 --- a/lib/kernel/src/inet_int.hrl
 +++ b/lib/kernel/src/inet_int.hrl
-@@ -29,6 +29,7 @@
+@@ -28,6 +28,7 @@
  -define(INET_AF_INET6,        2).
  -define(INET_AF_ANY,          3). % Fake for ANY in any address family
  -define(INET_AF_LOOPBACK,     4). % Fake for LOOPBACK in any address family
@@ -574,15 +511,7 @@ index bfe4c9e..0a22012 100644
  
  %% type codes to open and gettype - INET_REQ_GETTYPE
  -define(INET_TYPE_STREAM,     1).
-@@ -149,6 +150,7 @@
- -define(INET_LOPT_MSGQ_LOWTRMRK,  37).
- -define(INET_LOPT_NETNS,          38).
- -define(INET_LOPT_TCP_SHOW_ECONNRESET, 39).
-+-define(INET_LOPT_LINE_DELIM,     40).
- % Specific SCTP options: separate range:
- -define(SCTP_OPT_RTOINFO,	 	100).
- -define(SCTP_OPT_ASSOCINFO,	 	101).
-@@ -377,7 +379,8 @@
+@@ -375,7 +376,8 @@
  	{ 
  	  ifaddr = any,     %% bind to interface address
  	  port   = 0,       %% bind to port (default is dynamic port)
@@ -592,7 +521,7 @@ index bfe4c9e..0a22012 100644
  	  opts   = []       %% [{active,true}] added in inet:connect_options
  	 }).
  
-@@ -387,6 +390,7 @@
+@@ -385,6 +387,7 @@
  	  port   = 0,                %% bind to port (default is dynamic port)
  	  backlog = ?LISTEN_BACKLOG, %% backlog
  	  fd      = -1,              %% %% fd >= 0 => already bound
@@ -600,7 +529,7 @@ index bfe4c9e..0a22012 100644
  	  opts   = []                %% [{active,true}] added in 
  	                             %% inet:listen_options
  	 }).
-@@ -396,6 +400,7 @@
+@@ -394,6 +397,7 @@
  	  ifaddr = any,
  	  port   = 0,
  	  fd     = -1,
@@ -609,10 +538,10 @@ index bfe4c9e..0a22012 100644
  	 }).
  
 diff --git a/lib/kernel/src/inet_tcp.erl b/lib/kernel/src/inet_tcp.erl
-index b5c758c..ca4dd20 100644
+index 4c2db16..5740eeb 100644
 --- a/lib/kernel/src/inet_tcp.erl
 +++ b/lib/kernel/src/inet_tcp.erl
-@@ -94,9 +94,10 @@ do_connect({A,B,C,D}, Port, Opts, Time) when ?ip(A,B,C,D), ?port(Port) ->
+@@ -93,9 +93,10 @@ do_connect({A,B,C,D}, Port, Opts, Time) when ?ip(A,B,C,D), ?port(Port) ->
  	{ok, #connect_opts{fd=Fd,
  			   ifaddr=BAddr={Ab,Bb,Cb,Db},
  			   port=BPort,
@@ -624,7 +553,7 @@ index b5c758c..ca4dd20 100644
  		{ok, S} ->
  		    case prim_inet:connect(S, {A,B,C,D}, Port, Time) of
  			ok    -> {ok,S};
-@@ -116,9 +117,10 @@ listen(Port, Opts) ->
+@@ -115,9 +116,10 @@ listen(Port, Opts) ->
  	{ok, #listen_opts{fd=Fd,
  			  ifaddr=BAddr={A,B,C,D},
  			  port=BPort,
@@ -636,7 +565,7 @@ index b5c758c..ca4dd20 100644
  		{ok, S} ->
  		    case prim_inet:listen(S, R#listen_opts.backlog) of
  			ok -> {ok, S};
-@@ -151,4 +153,7 @@ accept(L,Timeout) ->
+@@ -150,4 +152,7 @@ accept(L,Timeout) ->
  %% Create a port/socket from a file descriptor 
  %%
  fdopen(Fd, Opts) ->
@@ -646,10 +575,10 @@ index b5c758c..ca4dd20 100644
 +fdopen(Fd, Family, Opts) ->
 +    inet:fdopen(Fd, Opts, tcp, Family, stream, ?MODULE).
 diff --git a/lib/kernel/src/inet_udp.erl b/lib/kernel/src/inet_udp.erl
-index 5b2e512..74b2874 100644
+index 80d930f..6fdd404 100644
 --- a/lib/kernel/src/inet_udp.erl
 +++ b/lib/kernel/src/inet_udp.erl
-@@ -52,8 +52,9 @@ open(Port, Opts) ->
+@@ -51,8 +51,9 @@ open(Port, Opts) ->
  	{ok, #udp_opts{fd=Fd,
  		       ifaddr=BAddr={A,B,C,D},
  		       port=BPort,
@@ -660,7 +589,7 @@ index 5b2e512..74b2874 100644
  	{ok, _} -> exit(badarg)
      end.
  
-@@ -92,9 +93,12 @@ controlling_process(Socket, NewOwner) ->
+@@ -91,9 +92,12 @@ controlling_process(Socket, NewOwner) ->
  %% Create a port/socket from a file descriptor 
  %%
  fdopen(Fd, Opts) ->
@@ -674,3 +603,6 @@ index 5b2e512..74b2874 100644
  
  
  %% Remove all duplicate options from an option list.
+-- 
+2.1.2
+
