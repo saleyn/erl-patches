@@ -1,21 +1,5 @@
---- lib/sasl/src/alarm_handler.erl.orig	2015-09-22 15:10:57.000000000 -0400
-+++ lib/sasl/src/alarm_handler.erl	2015-09-29 14:22:35.285802266 -0400
-@@ -60,7 +60,12 @@
- %% Returns: [{AlarmId, AlarmDesc}]
- %%-----------------------------------------------------------------
- get_alarms() ->
--    gen_event:call(alarm_handler, alarm_handler, get_alarms).
-+    case gen_event:which_handlers(alarm_handler) of
-+    [M | _] ->
-+        gen_event:call(alarm_handler, M, get_alarms);
-+    [] ->
-+        []
-+    end.
- 
- add_alarm_handler(Module) when is_atom(Module) ->
-     gen_event:add_handler(alarm_handler, Module, []).
---- lib/stdlib/src/edlin.erl.orig	2015-09-22 15:10:57.000000000 -0400
-+++ lib/stdlib/src/edlin.erl	2015-09-29 14:22:35.285802266 -0400
+--- a/lib/stdlib/src/edlin.erl.orig	2015-09-22 15:10:57.000000000 -0400
++++ b/lib/stdlib/src/edlin.erl	2015-09-29 14:22:35.285802266 -0400
 @@ -89,6 +89,12 @@
  
  edit([C|Cs], P, Line, {blink,_}, [_|Rs]) ->	%Remove blink here
@@ -57,8 +41,8 @@
  do_op(yank, Bef, [], Rs) ->
      Kill = get(kill_buffer),
      {{reverse(Kill, Bef),[]},[{put_chars, unicode,Kill}|Rs]};
---- lib/syntax_tools/src/erl_prettypr.erl.orig	2015-09-22 15:10:57.000000000 -0400
-+++ lib/syntax_tools/src/erl_prettypr.erl	2015-09-29 14:22:35.285802266 -0400
+--- a/lib/syntax_tools/src/erl_prettypr.erl.orig	2015-09-22 15:10:57.000000000 -0400
++++ b/lib/syntax_tools/src/erl_prettypr.erl	2015-09-29 14:22:35.285802266 -0400
 @@ -682,10 +682,17 @@
  
  	binary ->

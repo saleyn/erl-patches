@@ -1,0 +1,16 @@
+--- a/lib/debugger/src/dbg_wx_code.erl.orig	2016-02-01 16:33:38.022053329 -0500
++++ b/lib/debugger/src/dbg_wx_code.erl	2016-02-01 16:31:56.924049007 -0500
+@@ -88,10 +88,12 @@
+ 	       {?wxSTC_ERLANG_MODULES, {64,102,244}},
+ 	       {?wxSTC_ERLANG_MODULES_ATT, {64,102,244}}
+ 	      ],
++    ?stc:styleSetBackground(Ed, ?wxSTC_STYLE_DEFAULT, {180,180,180}),
+ 
+     SetStyle = fun({Style, Color}) ->
+ 		       ?stc:styleSetFont(Ed, Style, FixedFont),
+-		       ?stc:styleSetForeground(Ed, Style, Color)
++		       ?stc:styleSetForeground(Ed, Style, Color),
++               ?stc:styleSetBackground(Ed, Style, {180,180,180})
+ 	       end,
+     [SetStyle(Style) || Style <- Styles],
+     ?stc:setKeyWords(Ed, 0, keyWords()),

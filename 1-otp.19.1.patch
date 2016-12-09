@@ -1,0 +1,261 @@
+--- lib/stdlib/src/edlin.erl.orig	2016-12-09 09:53:18.797944213 -0500
++++ lib/stdlib/src/edlin.erl	2016-12-09 09:53:41.614958526 -0500
+@@ -89,6 +89,12 @@
+ 
+ edit([C|Cs], P, Line, {blink,_}, [_|Rs]) ->	%Remove blink here
+     edit([C|Cs], P, Line, none, Rs);
++edit("\e[3~"++Cs, P, {Bef,Aft}, Prefix, Rs) -> % `Del' key
++    edit([$\^D|Cs], P, {Bef,Aft}, Prefix, Rs);
++edit("[1;5D"++Cs, P, {Bef,Aft}, Prefix, Rs) -> % ^<-  move left one word
++    edit([$B|Cs], P, {Bef,Aft}, Prefix, Rs);
++edit("[1;5C"++Cs, P, {Bef,Aft}, Prefix, Rs) -> % ^->  move right one word
++    edit([$F|Cs], P, {Bef,Aft}, Prefix, Rs);
+ edit([C|Cs], P, {Bef,Aft}, Prefix, Rs0) ->
+     case key_map(C, Prefix) of
+ 	meta ->
+@@ -196,7 +202,7 @@
+ key_map($\^K, none) -> kill_line;
+ key_map($\r, none) -> new_line;
+ key_map($\^T, none) -> transpose_char;
+-key_map($\^U, none) -> ctlu;
++key_map($\^U, none) -> kill_full_line;
+ key_map($\^], none) -> auto_blink;
+ key_map($\^X, none) -> ctlx;
+ key_map($\^Y, none) -> yank;
+@@ -231,6 +237,8 @@
+ key_map($F, meta_left_sq_bracket) -> end_of_line;
+ key_map($D, meta_left_sq_bracket) -> backward_char;
+ key_map($C, meta_left_sq_bracket) -> forward_char;
++key_map($H, meta_left_sq_bracket) -> beginning_of_line; % Home key
++key_map($F, meta_left_sq_bracket) -> end_of_line;       % End key
+ % support a few <CTRL>+<CURSOR LEFT|RIGHT> combinations...
+ %  - forward:  \e\e[C, \e[5C, \e[1;5C
+ %  - backward: \e\e[D, \e[5D, \e[1;5D
+@@ -382,6 +390,9 @@
+ do_op(kill_line, Bef, Aft, Rs) ->
+     put(kill_buffer, Aft),
+     {{Bef,[]},[{delete_chars,length(Aft)}|Rs]};
++do_op(kill_full_line, Bef, Aft, Rs) ->
++    put(kill_buffer, reverse(Bef)++Aft),
++    {{[],[]},[{delete_chars,-length(Bef)},{delete_chars,length(Aft)}|Rs]};
+ do_op(yank, Bef, [], Rs) ->
+     Kill = get(kill_buffer),
+     {{reverse(Kill, Bef),[]},[{put_chars, unicode,Kill}|Rs]};
+--- lib/syntax_tools/src/erl_prettypr.erl.orig	2016-12-09 09:53:18.801277597 -0500
++++ lib/syntax_tools/src/erl_prettypr.erl	2016-12-09 09:53:41.614958526 -0500
+@@ -734,10 +734,17 @@
+ 
+ 	binary ->
+ 	    Ctxt1 = reset_prec(Ctxt),
+-	    Es = seq(erl_syntax:binary_fields(Node),
+-		     floating(text(",")), Ctxt1, fun lay/2),
++	    BinEls = erl_syntax:binary_fields(Node),
++	    Ints = lists:map(fun({integer,_,I}) -> I; (X) -> X end,
++	        [erl_syntax:binary_field_body(I) || I <- BinEls]),
++	    Es = case io_lib:printable_list(Ints) of
++	        true ->
++	            lay(erl_syntax:string(Ints), Ctxt1);
++	        false ->
++	            par(seq(BinEls, floating(text(",")), Ctxt1, fun lay/2))
++	    end,
+ 	    beside(floating(text("<<")),
+-		   beside(par(Es), floating(text(">>"))));
++		   beside(Es, floating(text(">>"))));
+ 
+ 	binary_field ->
+ 	    Ctxt1 = set_prec(Ctxt, max_prec()),
+--- erts/emulator/drivers/common/efile_drv.c.orig	2016-12-09 09:53:18.801277597 -0500
++++ erts/emulator/drivers/common/efile_drv.c	2016-12-09 09:53:41.621625294 -0500
+@@ -78,6 +78,7 @@
+ 
+ #define FILE_OPT_DELAYED_WRITE 0
+ #define FILE_OPT_READ_AHEAD    1
++#define FILE_OPT_DELIMITER     2
+ 
+ /* IPREAD variants */
+ 
+@@ -316,6 +317,7 @@
+     ErlDrvPDL       q_mtx;    /* Mutex for the driver queue, known by the emulator. Also used for
+ 				 mutual exclusion when accessing field(s) below. */
+     size_t          write_buffered;
++    char            delimiter;  /* read_line delimiter (def: '\n') */
+ #ifdef USE_VM_PROBES
+     int             idnum;      /* Unique ID # for this driver thread/desc */
+     char            port_str[DTRACE_TERM_BUF_SIZE];
+@@ -462,6 +464,7 @@
+ 	    size_t        read_size; /* in - out */
+ 	    size_t        nl_pos; /* out */
+ 	    short         nl_skip; /* out, 0 or 1 */
++	    char          delimiter;
+ #if !ALWAYS_READ_LINE_AHEAD
+ 	    short         read_ahead; /* in, bool */
+ #endif
+@@ -786,6 +789,7 @@
+     desc->write_error = 0;
+     MUTEX_INIT(desc->q_mtx, port); /* Refc is one, referenced by emulator now */
+     desc->write_buffered = 0;
++    desc->delimiter = '\n';        /* default line delimiter is '\n' */
+ #ifdef  USE_VM_PROBES
+     dtrace_drvport_str(port, desc->port_str);
+     get_dt_private(0);           /* throw away return value */
+@@ -1204,15 +1208,17 @@
+ 				&read_size);
+ 	}
+ 	if ( (d->result_ok = status)) {
++	    char delim   = d->c.read_line.delimiter;
+ 	    void *nl_ptr = memchr((d->c.read_line.binp)->orig_bytes + 
+-				  d->c.read_line.read_offset + d->c.read_line.read_size,'\n',read_size);
++				  d->c.read_line.read_offset + d->c.read_line.read_size,
++                                  delim,read_size);
+ 	    ASSERT(read_size <= size);
+ 	    d->c.read_line.read_size += read_size;
+ 	    if (nl_ptr != NULL) {
+ 		/* If found, we're done */
+ 		d->c.read_line.nl_pos = ((char *) nl_ptr) - 
+ 		    ((char *) ((d->c.read_line.binp)->orig_bytes)) + 1;
+-		if (d->c.read_line.nl_pos > 1 &&
++		if (delim == '\n' && d->c.read_line.nl_pos > 1 &&
+ 		    *(((char *) nl_ptr) - 1) == '\r') {
+ 		    --d->c.read_line.nl_pos;
+ 		    *(((char *) nl_ptr) - 1) = '\n';
+@@ -3410,13 +3416,15 @@
+ 	}
+ 	if (desc->read_size > 0) {
+ 	    /* look for '\n' in what we'we already got */
+-	    void *nl_ptr = memchr(desc->read_binp->orig_bytes + desc->read_offset,'\n',desc->read_size);
++	    char delim   = desc->delimiter;
++	    void *nl_ptr = memchr(desc->read_binp->orig_bytes + desc->read_offset,delim,desc->read_size);
+ 	    if (nl_ptr != NULL) {
+ 		/* If found, we're done */
+ 		int skip = 0;
+ 		size_t size = ((char *) nl_ptr) - 
+ 		    ((char *) (desc->read_binp->orig_bytes + desc->read_offset)) + 1;
+ 		if (size > 1 &&
++		    delim == '\n' &&
+ 		    *(((char *) nl_ptr) - 1) == '\r') {
+ 		    *(((char *) nl_ptr) - 1) = '\n';		    
+ 		    skip = 1;
+@@ -3454,6 +3462,7 @@
+ 	d->c.read_line.binp = desc->read_binp;
+ 	d->c.read_line.read_offset = desc->read_offset;
+ 	d->c.read_line.read_size = desc->read_size;
++	d->c.read_line.delimiter = desc->delimiter;
+ #ifdef USE_VM_PROBES
+ 	dt_i1 = d->fd;
+ 	dt_i2 = d->flags;
+@@ -4076,6 +4085,16 @@
+ 	    TRACE_C('K');
+ 	    reply_ok(desc);
+ 	} goto done;
++	case FILE_OPT_DELIMITER: {
++	    char delim;
++	    if (ev->size != 1+1+1
++	        || !EV_GET_CHAR(ev, &delim, &p, &q)) {
++		reply_posix_error(desc, EINVAL);
++		goto done;
++	    }
++	    desc->delimiter = delim;
++	    reply_ok(desc);
++	} goto done;
+ 	default:
+ 	    reply_posix_error(desc, EINVAL);
+ 	    goto done;
+--- erts/preloaded/src/prim_file.erl.orig	2016-12-09 09:53:18.804610981 -0500
++++ erts/preloaded/src/prim_file.erl	2016-12-09 09:53:41.621625294 -0500
+@@ -138,6 +138,7 @@
+ %% Options
+ -define(FILE_OPT_DELAYED_WRITE, 0).
+ -define(FILE_OPT_READ_AHEAD,    1).
++-define(FILE_OPT_DELIMITER,     2).
+ 
+ %% IPREAD variants
+ -define(IPREAD_S32BU_P32BU, 0).
+@@ -1239,6 +1240,10 @@
+ 	true ->
+ 	    einval
+     end;
++open_mode([{line_delimiter, Char}|Rest], Mode, Portopts, Setopts)
++  when is_integer(Char), 0 =< Char, Char =< 255 ->
++    open_mode(Rest, Mode, Portopts,
++          [<<?FILE_SETOPT, ?FILE_OPT_DELIMITER, Char>> | Setopts]);
+ open_mode([], Mode, Portopts, Setopts) ->
+     {Mode, reverse(Portopts), reverse(Setopts)};
+ open_mode(_, _Mode, _Portopts, _Setopts) ->
+--- lib/kernel/doc/src/file.xml.orig	2016-12-09 09:53:18.804610981 -0500
++++ lib/kernel/doc/src/file.xml	2016-12-09 09:53:41.621625294 -0500
+@@ -800,6 +800,12 @@
+               less than, or even greater than <c>Size</c> bytes, no
+               performance gain can be expected.</p>
+           </item>
++          <tag><c>{line_delimiter, Delimiter}</c></tag>
++          <item>
++            <p>When file is opened in the <c>raw</c> mode, <c>Delimiter</c> tells
++              <c>read_line/1</c> to use the <c>Delimiter</c> character for line
++              delimitation.  Default value for <c>Delimiter</c> is <c>$\n</c></p>
++          </item>
+           <tag><c>read_ahead</c></tag>
+           <item>
+             <p>The same as <c>{read_ahead, Size}</c> with a reasonable
+--- lib/kernel/test/file_SUITE.erl.orig	2016-12-09 09:53:18.804610981 -0500
++++ lib/kernel/test/file_SUITE.erl	2016-12-09 09:53:41.621625294 -0500
+@@ -85,7 +85,7 @@
+ 
+ -export([large_file/0, large_file/1, large_write/0, large_write/1]).
+ 
+--export([read_line_1/1, read_line_2/1, read_line_3/1,read_line_4/1]).
++-export([read_line_1/1, read_line_2/1, read_line_3/1,read_line_4/1,read_line_5/1]).
+ 
+ -export([advise/1]).
+ 
+@@ -4014,6 +4014,35 @@
+       end || {_,File,_,Y} <- All , Y =:= fail],
+     read_line_remove_files(All),
+     ok.
++read_line_5(suite) ->
++    [];
++read_line_5(doc) ->
++    ["read_line with custom line delimiter"];
++read_line_5(Config) when is_list(Config) ->
++    PrivDir = ?config(priv_dir, Config),
++    File    = filename:join(PrivDir, "read_line_test_delim.txt"),
++    file:delete(File),
++    ok      = file:write_file(File, <<"abc",0,"efg",0,"kkk">>),
++    {ok,F1} = file:open(File, [binary,raw,{line_delimiter, 0}]),
++    {ok,<<"abc",0>>} = file:read_line(F1),
++    {ok,<<"efg",0>>} = file:read_line(F1),
++    {ok,<<"kkk">>}   = file:read_line(F1),
++    eof              = file:read_line(F1),
++    ok      = file:close(F1),
++    ok      = file:write_file(File, <<"abcXefgXkkk">>),
++    {ok,F2} = file:open(File, [binary,raw,{line_delimiter, $X}]),
++    {ok,<<"abcX">>}  = file:read_line(F2),
++    {ok,<<"efgX">>}  = file:read_line(F2),
++    {ok,<<"kkk">>}   = file:read_line(F2),
++    eof              = file:read_line(F2),
++    ok      = file:close(F2),
++    ok      = file:write_file(File, <<"abc\nefg\nkkk">>),
++    {ok,F3} = file:open(File, [binary,raw]),
++    {ok,<<"abc\n">>} = file:read_line(F3),
++    {ok,<<"efg\n">>} = file:read_line(F3),
++    {ok,<<"kkk">>}   = file:read_line(F3),
++    eof              = file:read_line(F3),
++    ok      = file:close(F3).
+ 
+ rl_lines() ->
+     [ <<"hej">>,<<"hopp">>,<<"i">>,<<"lingon\rskogen">>].
+--- lib/debugger/src/dbg_wx_code.erl.orig	2016-12-09 09:39:28.228919568 -0500
++++ lib/debugger/src/dbg_wx_code.erl	2016-12-09 09:53:41.628292062 -0500
+@@ -88,10 +88,12 @@
+ 	       {?wxSTC_ERLANG_MODULES, {64,102,244}},
+ 	       {?wxSTC_ERLANG_MODULES_ATT, {64,102,244}}
+ 	      ],
++    ?stc:styleSetBackground(Ed, ?wxSTC_STYLE_DEFAULT, {180,180,180}),
+ 
+     SetStyle = fun({Style, Color}) ->
+ 		       ?stc:styleSetFont(Ed, Style, FixedFont),
+-		       ?stc:styleSetForeground(Ed, Style, Color)
++		       ?stc:styleSetForeground(Ed, Style, Color),
++               ?stc:styleSetBackground(Ed, Style, {180,180,180})
+ 	       end,
+     [SetStyle(Style) || Style <- Styles],
+     ?stc:setKeyWords(Ed, 0, keyWords()),
