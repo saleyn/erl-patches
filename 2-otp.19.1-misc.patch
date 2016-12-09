@@ -22,15 +22,6 @@
  key_map($\^], none) -> auto_blink;
  key_map($\^X, none) -> ctlx;
  key_map($\^Y, none) -> yank;
-@@ -229,6 +235,8 @@
- key_map($[, meta) -> meta_left_sq_bracket;
- key_map($D, meta_left_sq_bracket) -> backward_char;
- key_map($C, meta_left_sq_bracket) -> forward_char;
-+key_map($H, meta_left_sq_bracket) -> beginning_of_line; % Home key
-+key_map($F, meta_left_sq_bracket) -> end_of_line;       % End key
- % support a few <CTRL>+<CURSOR LEFT|RIGHT> combinations...
- %  - forward:  \e\e[C, \e[5C, \e[1;5C
- %  - backward: \e\e[D, \e[5D, \e[1;5D
 @@ -378,6 +386,9 @@
  do_op(kill_line, Bef, Aft, Rs) ->
      put(kill_buffer, Aft),
