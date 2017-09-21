@@ -1,24 +1,63 @@
-From 1da53f86d102852c3f728e3de27fb2f3923e2092 Mon Sep 17 00:00:00 2001
-From: Serge Aleynikov <saleyn@gmail.com>
-Date: Mon, 1 Jun 2015 14:07:54 -0400
-Subject: [PATCH] Add {line_delimiter, Char} option to file:open/2
-
-The new option {line_delimiter, Delimiter::char()} affects how file:read_line/1
-delimits lines.  When file is opened in the raw mode, Delimiter tells
-file:read_line/1 to use the Delimiter character for line
-delimitation.  Default value for Delimiter is $\n.
----
- erts/emulator/drivers/common/efile_drv.c | 25 ++++++++++++++++++++++---
- erts/preloaded/src/prim_file.erl         |  5 +++++
- lib/kernel/doc/src/file.xml              |  6 ++++++
- lib/kernel/test/file_SUITE.erl           | 31 ++++++++++++++++++++++++++++++-
- 4 files changed, 63 insertions(+), 4 deletions(-)
-
-diff --git a/erts/emulator/drivers/common/efile_drv.c b/erts/emulator/drivers/common/efile_drv.c
-index b2cfe70..f8384e0 100644
---- a/erts/emulator/drivers/common/efile_drv.c
-+++ b/erts/emulator/drivers/common/efile_drv.c
-@@ -77,6 +77,7 @@
+--- lib/stdlib/src/edlin.erl.orig	2017-06-20 14:56:09.000000000 -0400
++++ lib/stdlib/src/edlin.erl	2017-09-21 11:09:39.257868343 -0400
+@@ -89,6 +89,12 @@
+ 
+ edit([C|Cs], P, Line, {blink,_}, [_|Rs]) ->	%Remove blink here
+     edit([C|Cs], P, Line, none, Rs);
++edit("\e[3~"++Cs, P, {Bef,Aft}, Prefix, Rs) -> % `Del' key
++    edit([$\^D|Cs], P, {Bef,Aft}, Prefix, Rs);
++edit("[1;5D"++Cs, P, {Bef,Aft}, Prefix, Rs) -> % ^<-  move left one word
++    edit([$B|Cs], P, {Bef,Aft}, Prefix, Rs);
++edit("[1;5C"++Cs, P, {Bef,Aft}, Prefix, Rs) -> % ^->  move right one word
++    edit([$F|Cs], P, {Bef,Aft}, Prefix, Rs);
+ edit([C|Cs], P, {Bef,Aft}, Prefix, Rs0) ->
+     case key_map(C, Prefix) of
+ 	meta ->
+@@ -196,7 +202,7 @@
+ key_map($\^K, none) -> kill_line;
+ key_map($\r, none) -> new_line;
+ key_map($\^T, none) -> transpose_char;
+-key_map($\^U, none) -> ctlu;
++key_map($\^U, none) -> kill_full_line;
+ key_map($\^], none) -> auto_blink;
+ key_map($\^X, none) -> ctlx;
+ key_map($\^Y, none) -> yank;
+@@ -382,6 +388,9 @@
+ do_op(kill_line, Bef, Aft, Rs) ->
+     put(kill_buffer, Aft),
+     {{Bef,[]},[{delete_chars,length(Aft)}|Rs]};
++do_op(kill_full_line, Bef, Aft, Rs) ->
++    put(kill_buffer, reverse(Bef)++Aft),
++    {{[],[]},[{delete_chars,-length(Bef)},{delete_chars,length(Aft)}|Rs]};
+ do_op(yank, Bef, [], Rs) ->
+     Kill = get(kill_buffer),
+     {{reverse(Kill, Bef),[]},[{put_chars, unicode,Kill}|Rs]};
+--- lib/syntax_tools/src/erl_prettypr.erl.orig	2017-06-20 14:56:09.000000000 -0400
++++ lib/syntax_tools/src/erl_prettypr.erl	2017-09-21 11:09:39.257868343 -0400
+@@ -739,10 +739,17 @@
+ 
+ 	binary ->
+ 	    Ctxt1 = reset_prec(Ctxt),
+-	    Es = seq(erl_syntax:binary_fields(Node),
+-		     floating(text(",")), Ctxt1, fun lay/2),
++	    BinEls = erl_syntax:binary_fields(Node),
++	    Ints = lists:map(fun({integer,_,I}) -> I; (X) -> X end,
++	        [erl_syntax:binary_field_body(I) || I <- BinEls]),
++	    Es = case io_lib:printable_list(Ints) of
++	        true ->
++	            lay(erl_syntax:string(Ints), Ctxt1);
++	        false ->
++	            par(seq(BinEls, floating(text(",")), Ctxt1, fun lay/2))
++	    end,
+ 	    beside(floating(text("<<")),
+-		   beside(par(Es), floating(text(">>"))));
++		   beside(Es, floating(text(">>"))));
+ 
+ 	binary_field ->
+ 	    Ctxt1 = set_prec(Ctxt, max_prec()),
+--- erts/emulator/drivers/common/efile_drv.c.orig	2017-06-20 14:56:09.000000000 -0400
++++ erts/emulator/drivers/common/efile_drv.c	2017-09-21 11:09:39.261203395 -0400
+@@ -78,6 +78,7 @@
  
  #define FILE_OPT_DELAYED_WRITE 0
  #define FILE_OPT_READ_AHEAD    1
@@ -26,7 +65,7 @@ index b2cfe70..f8384e0 100644
  
  /* IPREAD variants */
  
-@@ -323,6 +324,7 @@ typedef struct {
+@@ -316,6 +317,7 @@
      ErlDrvPDL       q_mtx;    /* Mutex for the driver queue, known by the emulator. Also used for
  				 mutual exclusion when accessing field(s) below. */
      size_t          write_buffered;
@@ -34,7 +73,7 @@ index b2cfe70..f8384e0 100644
  #ifdef USE_VM_PROBES
      int             idnum;      /* Unique ID # for this driver thread/desc */
      char            port_str[DTRACE_TERM_BUF_SIZE];
-@@ -469,6 +471,7 @@ struct t_data
+@@ -462,6 +464,7 @@
  	    size_t        read_size; /* in - out */
  	    size_t        nl_pos; /* out */
  	    short         nl_skip; /* out, 0 or 1 */
@@ -42,7 +81,7 @@ index b2cfe70..f8384e0 100644
  #if !ALWAYS_READ_LINE_AHEAD
  	    short         read_ahead; /* in, bool */
  #endif
-@@ -804,6 +807,7 @@ file_start(ErlDrvPort port, char* command)
+@@ -786,6 +789,7 @@
      desc->write_error = 0;
      MUTEX_INIT(desc->q_mtx, port); /* Refc is one, referenced by emulator now */
      desc->write_buffered = 0;
@@ -50,7 +89,7 @@ index b2cfe70..f8384e0 100644
  #ifdef  USE_VM_PROBES
      dtrace_drvport_str(port, desc->port_str);
      get_dt_private(0);           /* throw away return value */
-@@ -1222,15 +1226,17 @@ static void invoke_read_line(void *data)
+@@ -1204,15 +1208,17 @@
  				&read_size);
  	}
  	if ( (d->result_ok = status)) {
@@ -70,7 +109,7 @@ index b2cfe70..f8384e0 100644
  		    *(((char *) nl_ptr) - 1) == '\r') {
  		    --d->c.read_line.nl_pos;
  		    *(((char *) nl_ptr) - 1) = '\n';
-@@ -3429,13 +3435,15 @@ file_outputv(ErlDrvData e, ErlIOVec *ev) {
+@@ -3411,13 +3417,15 @@
  	}
  	if (desc->read_size > 0) {
  	    /* look for '\n' in what we'we already got */
@@ -87,7 +126,7 @@ index b2cfe70..f8384e0 100644
  		    *(((char *) nl_ptr) - 1) == '\r') {
  		    *(((char *) nl_ptr) - 1) = '\n';		    
  		    skip = 1;
-@@ -3473,6 +3481,7 @@ file_outputv(ErlDrvData e, ErlIOVec *ev) {
+@@ -3455,6 +3463,7 @@
  	d->c.read_line.binp = desc->read_binp;
  	d->c.read_line.read_offset = desc->read_offset;
  	d->c.read_line.read_size = desc->read_size;
@@ -95,7 +134,7 @@ index b2cfe70..f8384e0 100644
  #ifdef USE_VM_PROBES
  	dt_i1 = d->fd;
  	dt_i2 = d->flags;
-@@ -4095,6 +4104,16 @@ file_outputv(ErlDrvData e, ErlIOVec *ev) {
+@@ -4077,6 +4086,16 @@
  	    TRACE_C('K');
  	    reply_ok(desc);
  	} goto done;
@@ -112,11 +151,9 @@ index b2cfe70..f8384e0 100644
  	default:
  	    reply_posix_error(desc, EINVAL);
  	    goto done;
-diff --git a/erts/preloaded/src/prim_file.erl b/erts/preloaded/src/prim_file.erl
-index 3467940..36c9ce0 100644
---- a/erts/preloaded/src/prim_file.erl
-+++ b/erts/preloaded/src/prim_file.erl
-@@ -137,6 +137,7 @@
+--- erts/preloaded/src/prim_file.erl.orig	2017-06-20 14:56:09.000000000 -0400
++++ erts/preloaded/src/prim_file.erl	2017-09-21 11:09:39.261203395 -0400
+@@ -138,6 +138,7 @@
  %% Options
  -define(FILE_OPT_DELAYED_WRITE, 0).
  -define(FILE_OPT_READ_AHEAD,    1).
@@ -124,7 +161,7 @@ index 3467940..36c9ce0 100644
  
  %% IPREAD variants
  -define(IPREAD_S32BU_P32BU, 0).
-@@ -1238,6 +1239,10 @@ open_mode([{read_ahead, Size}|Rest], Mode, Portopts, Setopts)
+@@ -1239,6 +1240,10 @@
  	true ->
  	    einval
      end;
@@ -135,11 +172,9 @@ index 3467940..36c9ce0 100644
  open_mode([], Mode, Portopts, Setopts) ->
      {Mode, reverse(Portopts), reverse(Setopts)};
  open_mode(_, _Mode, _Portopts, _Setopts) ->
-diff --git a/lib/kernel/doc/src/file.xml b/lib/kernel/doc/src/file.xml
-index 338d62e..cc22ac5 100644
---- a/lib/kernel/doc/src/file.xml
-+++ b/lib/kernel/doc/src/file.xml
-@@ -766,6 +766,12 @@
+--- lib/kernel/doc/src/file.xml.orig	2017-06-20 14:56:09.000000000 -0400
++++ lib/kernel/doc/src/file.xml	2017-09-21 11:09:39.261203395 -0400
+@@ -800,6 +800,12 @@
                less than, or even greater than <c>Size</c> bytes, no
                performance gain can be expected.</p>
            </item>
@@ -152,22 +187,20 @@ index 338d62e..cc22ac5 100644
            <tag><c>read_ahead</c></tag>
            <item>
              <p>The same as <c>{read_ahead, Size}</c> with a reasonable
-diff --git a/lib/kernel/test/file_SUITE.erl b/lib/kernel/test/file_SUITE.erl
-index 1213d8e..e9a9782 100644
---- a/lib/kernel/test/file_SUITE.erl
-+++ b/lib/kernel/test/file_SUITE.erl
-@@ -83,7 +83,7 @@
+--- lib/kernel/test/file_SUITE.erl.orig	2017-06-20 14:56:09.000000000 -0400
++++ lib/kernel/test/file_SUITE.erl	2017-09-21 11:09:39.261203395 -0400
+@@ -85,7 +85,7 @@
  
- -export([large_file/1, large_write/1]).
+ -export([large_file/0, large_file/1, large_write/0, large_write/1]).
  
 --export([read_line_1/1, read_line_2/1, read_line_3/1,read_line_4/1]).
 +-export([read_line_1/1, read_line_2/1, read_line_3/1,read_line_4/1,read_line_5/1]).
  
  -export([advise/1]).
  
-@@ -4237,6 +4237,35 @@ read_line_4(Config) when is_list(Config) ->
- 	    end || {_,File,_,Y} <- All , Y =:= fail],
-     ?line read_line_remove_files(All),
+@@ -4022,6 +4022,35 @@
+       end || {_,File,_,Y} <- All , Y =:= fail],
+     read_line_remove_files(All),
      ok.
 +read_line_5(suite) ->
 +    [];
@@ -201,6 +234,19 @@ index 1213d8e..e9a9782 100644
  
  rl_lines() ->
      [ <<"hej">>,<<"hopp">>,<<"i">>,<<"lingon\rskogen">>].
--- 
-2.1.2
-
+--- lib/debugger/src/dbg_wx_code.erl.orig	2017-09-21 11:09:28.640242384 -0400
++++ lib/debugger/src/dbg_wx_code.erl	2017-09-21 11:09:39.267873498 -0400
+@@ -88,10 +88,12 @@
+ 	       {?wxSTC_ERLANG_MODULES, {64,102,244}},
+ 	       {?wxSTC_ERLANG_MODULES_ATT, {64,102,244}}
+ 	      ],
++    ?stc:styleSetBackground(Ed, ?wxSTC_STYLE_DEFAULT, {180,180,180}),
+ 
+     SetStyle = fun({Style, Color}) ->
+ 		       ?stc:styleSetFont(Ed, Style, FixedFont),
+-		       ?stc:styleSetForeground(Ed, Style, Color)
++		       ?stc:styleSetForeground(Ed, Style, Color),
++               ?stc:styleSetBackground(Ed, Style, {180,180,180})
+ 	       end,
+     [SetStyle(Style) || Style <- Styles],
+     ?stc:setKeyWords(Ed, 0, keyWords()),

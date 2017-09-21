@@ -1,6 +1,6 @@
 #!/bin/bash
 
-NEW_VSN=19.1
+NEW_VSN=20.0
 OLD_PATCH_FILE=1-otp.19.0.patch
 NEW_PATCH_FILE=1-otp.${NEW_VSN}.patch
 
